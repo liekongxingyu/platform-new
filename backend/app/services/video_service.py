@@ -9,16 +9,17 @@ import requests
 import os
 import glob
 import time
+import threading
 import subprocess
 import signal
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 import logging
 import sys
 import hashlib
 import base64
 import uuid
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 RECORDING_PROCESSES = {}
 
@@ -31,7 +32,6 @@ def suppress_verbose_logging():
 
 suppress_verbose_logging()
 
-from app.models.alarm_records import AlarmRecord
 from app.core.database import SessionLocal
 
 try:
@@ -52,8 +52,14 @@ NMS_MEDIA_ROOT = os.path.abspath(os.getenv("NMS_MEDIA_ROOT", r"C:\media"))
 # --- 全局缓存 ---
 ONVIF_CLIENT_CACHE = {}
 
+CAMERA_TIME_DRIFT_THRESHOLD_SECONDS = int(os.getenv("CAMERA_TIME_DRIFT_THRESHOLD_SECONDS", "120"))
+CAMERA_TIME_SYNC_COOLDOWN_SECONDS = int(os.getenv("CAMERA_TIME_SYNC_COOLDOWN_SECONDS", "1800"))
+CAMERA_TIMEZONE_TZ = os.getenv("CAMERA_TIMEZONE_TZ", "CST-8:00:00")
+CAMERA_TIME_SYNC_CACHE: Dict[int, float] = {}
+
 # [新增] 全局字典：用于存储正在运行的 FFmpeg 进程 {stream_name: process_object}
 FFMPEG_PROCESSES = {}
+CRUISE_TASKS = {}
 
 class VideoService:
     # -------------------------------------------------------------------------
@@ -105,6 +111,114 @@ class VideoService:
             logger.error(f"Connection Failed: {e}")
             raise ValueError(f"连接失败: {e}")
 
+    def _extract_onvif_datetime(self, value: Any, default_tz=timezone.utc) -> Optional[datetime]:
+        if not value:
+            return None
+
+        if isinstance(value, dict):
+            date_part = value.get("Date")
+            time_part = value.get("Time")
+        else:
+            date_part = getattr(value, "Date", None)
+            time_part = getattr(value, "Time", None)
+
+        if not date_part or not time_part:
+            return None
+
+        try:
+            year = int(date_part.get("Year") if isinstance(date_part, dict) else getattr(date_part, "Year"))
+            month = int(date_part.get("Month") if isinstance(date_part, dict) else getattr(date_part, "Month"))
+            day = int(date_part.get("Day") if isinstance(date_part, dict) else getattr(date_part, "Day"))
+            hour = int(time_part.get("Hour") if isinstance(time_part, dict) else getattr(time_part, "Hour"))
+            minute = int(time_part.get("Minute") if isinstance(time_part, dict) else getattr(time_part, "Minute"))
+            second = int(time_part.get("Second") if isinstance(time_part, dict) else getattr(time_part, "Second"))
+            return datetime(year, month, day, hour, minute, second, tzinfo=default_tz)
+        except Exception:
+            return None
+
+    def _sync_camera_time_for_video(self, db_video: VideoDevice, force: bool = False) -> dict:
+        if not db_video:
+            return {"status": "error", "message": "设备不存在"}
+
+        if not db_video.ip_address or not db_video.username or not db_video.password:
+            return {"status": "skipped", "message": "设备缺少 ONVIF 连接参数"}
+
+        now_ts = time.time()
+        last_sync_ts = CAMERA_TIME_SYNC_CACHE.get(db_video.id)
+        if (not force) and last_sync_ts and (now_ts - last_sync_ts < CAMERA_TIME_SYNC_COOLDOWN_SECONDS):
+            return {
+                "status": "skipped",
+                "message": "校时冷却中",
+                "next_sync_in_seconds": int(CAMERA_TIME_SYNC_COOLDOWN_SECONDS - (now_ts - last_sync_ts)),
+            }
+
+        try:
+            camera, _, _ = self._get_onvif_service(db_video)
+            devicemgmt = camera.create_devicemgmt_service()
+            date_time_info = devicemgmt.GetSystemDateAndTime()
+            system_date_time = getattr(date_time_info, "SystemDateAndTime", date_time_info)
+
+            utc_dt = getattr(system_date_time, "UTCDateTime", None)
+            local_dt = getattr(system_date_time, "LocalDateTime", None)
+
+            camera_time_utc = self._extract_onvif_datetime(utc_dt, timezone.utc)
+            if not camera_time_utc:
+                local_time = self._extract_onvif_datetime(local_dt, datetime.now().astimezone().tzinfo or timezone.utc)
+                if local_time:
+                    camera_time_utc = local_time.astimezone(timezone.utc)
+
+            now_utc = datetime.now(timezone.utc)
+            drift_seconds = None
+            if camera_time_utc:
+                drift_seconds = abs((now_utc - camera_time_utc).total_seconds())
+
+            if (not force) and drift_seconds is not None and drift_seconds < CAMERA_TIME_DRIFT_THRESHOLD_SECONDS:
+                CAMERA_TIME_SYNC_CACHE[db_video.id] = now_ts
+                return {
+                    "status": "skipped",
+                    "message": "摄像头时间在允许误差内",
+                    "drift_seconds": int(drift_seconds),
+                }
+
+            req = devicemgmt.create_type("SetSystemDateAndTime")
+            req.DateTimeType = "Manual"
+            req.DaylightSavings = False
+            req.TimeZone = {"TZ": CAMERA_TIMEZONE_TZ}
+            req.UTCDateTime = {
+                "Time": {
+                    "Hour": now_utc.hour,
+                    "Minute": now_utc.minute,
+                    "Second": now_utc.second,
+                },
+                "Date": {
+                    "Year": now_utc.year,
+                    "Month": now_utc.month,
+                    "Day": now_utc.day,
+                },
+            }
+            devicemgmt.SetSystemDateAndTime(req)
+
+            CAMERA_TIME_SYNC_CACHE[db_video.id] = now_ts
+            logger.info(
+                "Camera time synced for video_id=%s drift=%s seconds",
+                db_video.id,
+                int(drift_seconds) if drift_seconds is not None else "unknown",
+            )
+            return {
+                "status": "success",
+                "message": "摄像头时间已同步",
+                "drift_seconds_before_sync": int(drift_seconds) if drift_seconds is not None else None,
+            }
+        except Exception as e:
+            logger.warning(f"Camera time sync skipped for video_id={db_video.id}: {e}")
+            return {"status": "error", "message": f"摄像头校时失败: {e}"}
+
+    def sync_camera_time_if_needed(self, db: Session, video_id: int, force: bool = False) -> dict:
+        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        if not db_video:
+            return {"status": "error", "message": "设备不存在"}
+        return self._sync_camera_time_for_video(db_video, force=force)
+
     # -------------------------------------------------------------------------
     # 辅助: 生成 WS-Security Header (模拟 ODM 认证)
     # -------------------------------------------------------------------------
@@ -155,7 +269,7 @@ class VideoService:
     <Stop xmlns="http://www.onvif.org/ver20/ptz/wsdl">
       <ProfileToken>{profile_token}</ProfileToken>
       <PanTilt>true</PanTilt>
-      <Zoom>false</Zoom>
+            <Zoom>true</Zoom>
     </Stop>
   </s:Body>
 </s:Envelope>""",
@@ -246,10 +360,14 @@ class VideoService:
 
             pan = speed if direction == 'right' else (-speed if direction == 'left' else 0.0)
             tilt = speed if direction == 'up' else (-speed if direction == 'down' else 0.0)
+            zoom = speed if direction == 'zoom_in' else (-speed if direction == 'zoom_out' else 0.0)
 
             request = {
                 'ProfileToken': token,
-                'Velocity': {'PanTilt': {'x': pan, 'y': tilt}},
+                'Velocity': {
+                    'PanTilt': {'x': pan, 'y': tilt},
+                    'Zoom': {'x': zoom}
+                },
                 'Timeout': 'PT5S' 
             }
             ptz.ContinuousMove(request)
@@ -264,18 +382,208 @@ class VideoService:
         return profiles[0].token
 
     def _get_direction_name(self, direction: str) -> str:
-        return {'up':'上','down':'下','left':'左','right':'右'}.get(direction, direction)
+        return {
+            'up': '上',
+            'down': '下',
+            'left': '左',
+            'right': '右',
+            'zoom_in': '放大',
+            'zoom_out': '缩小',
+        }.get(direction, direction)
+
+    def _extract_ip_from_rtsp(self, rtsp_url: str) -> Optional[str]:
+        try:
+            parsed = urlparse(rtsp_url)
+            return parsed.hostname
+        except Exception:
+            return None
+
+    def _create_ptz_and_media(self, db: Session, video_id: int):
+        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        if not db_video:
+            raise ValueError("Device not found")
+        camera, ptz, media = self._get_onvif_service(db_video)
+        token = self._get_profile_token(media)
+        return db_video, camera, ptz, media, token
+
+    def list_presets(self, db: Session, video_id: int):
+        try:
+            _, _, ptz, _, token = self._create_ptz_and_media(db, video_id)
+            presets = ptz.GetPresets({'ProfileToken': token})
+        except Exception as e:
+            # 某些摄像头不支持预置点，或当前连接暂时不可用；此处降级为空列表，避免前端持续出现 400。
+            logger.warning(f"GetPresets failed for video_id={video_id}: {e}")
+            return []
+
+        result = []
+        for p in presets or []:
+            result.append({
+                "token": str(getattr(p, 'token', '') or ''),
+                "name": str(getattr(p, 'Name', None) or getattr(p, 'name', None) or f"Preset-{getattr(p, 'token', '')}")
+            })
+        return result
+
+    def set_preset(self, db: Session, video_id: int, name: Optional[str] = None, preset_token: Optional[str] = None):
+        _, _, ptz, _, token = self._create_ptz_and_media(db, video_id)
+        req = {'ProfileToken': token}
+        if name:
+            req['PresetName'] = name
+        if preset_token:
+            req['PresetToken'] = preset_token
+
+        try:
+            created_token = ptz.SetPreset(req)
+            return {
+                "token": str(created_token or preset_token or ''),
+                "name": name or f"Preset-{created_token}"
+            }
+        except Exception as e:
+            raise ValueError(f"创建预置点失败: {e}")
+
+    def goto_preset(self, db: Session, video_id: int, preset_token: str, speed: float = 0.5):
+        _, _, ptz, _, token = self._create_ptz_and_media(db, video_id)
+        req = {
+            'ProfileToken': token,
+            'PresetToken': preset_token,
+            'Speed': {
+                'PanTilt': {'x': speed, 'y': speed},
+                'Zoom': {'x': speed}
+            }
+        }
+        try:
+            ptz.GotoPreset(req)
+            return {"status": "success"}
+        except Exception as e:
+            raise ValueError(f"调用预置点失败: {e}")
+
+    def remove_preset(self, db: Session, video_id: int, preset_token: str):
+        _, _, ptz, _, token = self._create_ptz_and_media(db, video_id)
+        req = {'ProfileToken': token, 'PresetToken': preset_token}
+        try:
+            ptz.RemovePreset(req)
+            return {"status": "success"}
+        except Exception as e:
+            raise ValueError(f"删除预置点失败: {e}")
+
+    def remove_presets_bulk(self, db: Session, video_id: int, preset_tokens: list[str]):
+        if not preset_tokens:
+            raise ValueError("preset_tokens 不能为空")
+
+        _, _, ptz, _, token = self._create_ptz_and_media(db, video_id)
+        unique_tokens: list[str] = list(dict.fromkeys([str(t) for t in preset_tokens if str(t).strip()]))
+        if not unique_tokens:
+            raise ValueError("没有有效的预置点 token")
+
+        deleted_tokens: list[str] = []
+        failed_tokens: list[str] = []
+
+        for preset_token in unique_tokens:
+            req = {'ProfileToken': token, 'PresetToken': preset_token}
+            try:
+                ptz.RemovePreset(req)
+                deleted_tokens.append(preset_token)
+            except Exception as e:
+                logger.warning(f"Bulk remove preset failed video_id={video_id}, token={preset_token}: {e}")
+                failed_tokens.append(preset_token)
+
+        return {
+            "total": len(unique_tokens),
+            "deleted": len(deleted_tokens),
+            "failed": len(failed_tokens),
+            "deleted_tokens": deleted_tokens,
+            "failed_tokens": failed_tokens,
+        }
+
+    def _cruise_worker(self, db_factory, video_id: int, preset_tokens: list[str], dwell_seconds: float, rounds: Optional[int], stop_event: threading.Event):
+        db = db_factory()
+        completed_rounds = 0
+        try:
+            while not stop_event.is_set():
+                for preset in preset_tokens:
+                    if stop_event.is_set():
+                        return
+                    try:
+                        self.goto_preset(db, video_id, preset)
+                    except Exception as e:
+                        logger.warning(f"巡航跳转失败 video_id={video_id}, preset={preset}: {e}")
+
+                    if stop_event.wait(timeout=dwell_seconds):
+                        return
+
+                completed_rounds += 1
+                if rounds is not None and completed_rounds >= rounds:
+                    return
+        finally:
+            db.close()
+            task = CRUISE_TASKS.get(video_id)
+            if task and task.get("stop") is stop_event:
+                CRUISE_TASKS.pop(video_id, None)
+
+    def start_cruise(self, db: Session, video_id: int, preset_tokens: list[str], dwell_seconds: float = 8.0, rounds: Optional[int] = None):
+        if len(preset_tokens) < 2:
+            raise ValueError("巡航至少需要两个预置点")
+
+        available = {item["token"] for item in self.list_presets(db, video_id)}
+        missing = [token for token in preset_tokens if token not in available]
+        if missing:
+            raise ValueError(f"以下预置点不存在: {', '.join(missing)}")
+
+        self.stop_cruise(video_id)
+
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._cruise_worker,
+            args=(SessionLocal, video_id, preset_tokens, dwell_seconds, rounds, stop_event),
+            daemon=True
+        )
+        CRUISE_TASKS[video_id] = {
+            "thread": thread,
+            "stop": stop_event,
+            "presets": list(preset_tokens),
+            "dwell_seconds": dwell_seconds,
+            "rounds": rounds,
+        }
+        thread.start()
+        return {"status": "success"}
+
+    def stop_cruise(self, video_id: int):
+        task = CRUISE_TASKS.get(video_id)
+        if not task:
+            return {"status": "idle"}
+
+        stop_event = task.get("stop")
+        if stop_event:
+            stop_event.set()
+        CRUISE_TASKS.pop(video_id, None)
+        return {"status": "success"}
+
+    def get_cruise_status(self, video_id: int):
+        task = CRUISE_TASKS.get(video_id)
+        if not task:
+            return {"running": False}
+
+        thread = task.get("thread")
+        running = bool(thread and thread.is_alive())
+        return {
+            "running": running,
+            "preset_tokens": task.get("presets", []),
+            "dwell_seconds": task.get("dwell_seconds", 8.0),
+            "rounds": task.get("rounds"),
+        }
 
     # -------------------------------------------------------------------------
     # 核心业务: 添加/删除/更新
     # -------------------------------------------------------------------------
     def add_camera_to_media_server(self, db: Session, camera_data: CameraCreateRequest):
         logger.info(f"Adding stream: {camera_data.name}")
+        ip_address = camera_data.ip_address or self._extract_ip_from_rtsp(camera_data.rtsp_url) or ""
+        port = camera_data.port or 80
+
         # 先落库拿到稳定ID，再用 ID 作为 stream_name，避免名称改动导致流路径漂移。
         new_video = VideoDevice(
             name=camera_data.name,
-            ip_address=camera_data.ip_address,
-            port=camera_data.port,
+            ip_address=ip_address,
+            port=port,
             username=camera_data.username,
             password=camera_data.password,
             stream_url="",
@@ -289,6 +597,11 @@ class VideoService:
         db.commit()
         db.refresh(new_video)
 
+        # 新增或替换设备后先尝试同步摄像头时间，避免 OSD 时间持续漂移。
+        sync_result = self._sync_camera_time_for_video(new_video, force=True)
+        if sync_result.get("status") == "error":
+            logger.warning(f"Initial camera time sync failed for video_id={new_video.id}: {sync_result.get('message')}")
+
         stream_name = str(new_video.id)
 
         # 启动推流并更新播放地址
@@ -300,6 +613,11 @@ class VideoService:
         
         self.start_ffmpeg_recording(new_video.id, camera_data.rtsp_url)
         return new_video
+
+    def sync_hikvision_devices(self, db: Session):
+        # 当前项目以 RTSP/ONVIF 手动接入为主，保留同步接口避免路由调用时报错。
+        logger.info("sync_hikvision_devices called - manual RTSP/ONVIF flow is used")
+        return []
 
     def create_video(self, db: Session, video_data: VideoCreate):
         new_video = VideoDevice(**video_data.model_dump())
@@ -323,6 +641,7 @@ class VideoService:
         db.commit()
         db.refresh(db_video)
         if video_id in ONVIF_CLIENT_CACHE: del ONVIF_CLIENT_CACHE[video_id]
+        if video_id in CAMERA_TIME_SYNC_CACHE: del CAMERA_TIME_SYNC_CACHE[video_id]
         return db_video
 
     def delete_video(self, db: Session, video_id: int):
@@ -343,6 +662,11 @@ class VideoService:
         v = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
         if not v:
             return None
+
+        # 拉流前执行按需校时：超过阈值才改，且有冷却时间避免频繁写设备。
+        sync_result = self._sync_camera_time_for_video(v, force=False)
+        if sync_result.get("status") == "error":
+            logger.warning(f"Auto time sync failed for video_id={video_id}: {sync_result.get('message')}")
 
         # 懒启动推流：当前端请求播放地址时，如推流进程不存在则自动拉起。
         stream_name = str(v.id)
@@ -410,7 +734,7 @@ class VideoService:
             if os.name == 'nt':
                 # Windows 下使用 CREATE_NO_WINDOW (0x08000000) 彻底隐藏
                 creationflags = 0x08000000 
-            
+
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.DEVNULL, 
@@ -433,7 +757,7 @@ class VideoService:
         """
         global FFMPEG_PROCESSES
         process = FFMPEG_PROCESSES.get(stream_name)
-        
+
         if process:
             try:
                 logger.info(f"Stopping FFmpeg for {stream_name} (PID: {process.pid})...")
@@ -601,6 +925,13 @@ class VideoService:
             if not os.path.exists(file_path):
                 return False
 
+            # 录像按 60 秒分段，至少等待一个完整分段周期再参与拼接，
+            # 避免把仍在写入中的当前分段加入 concat。
+            seg_start = self._parse_segment_start(file_path)
+            if seg_start:
+                if (datetime.now() - seg_start).total_seconds() < 68:
+                    return False
+
             stat = os.stat(file_path)
             if stat.st_size < 64 * 1024:
                 return False
@@ -642,174 +973,6 @@ class VideoService:
         except Exception:
             return False
 
-    def _run_ffmpeg(self, command: List[str]):
-        wrapped = [command[0], "-hide_banner", "-loglevel", "error", *command[1:]]
-        result = subprocess.run(wrapped, capture_output=True, text=True)
-        ok = result.returncode == 0
-        stderr_tail = (result.stderr or "")[-800:]
-        return ok, stderr_tail
-
-    def _normalize_error_text(self, message: Optional[str], limit: int = 240) -> str:
-        text = (message or "未知错误").replace("\r", " ").replace("\n", " ").strip()
-        if len(text) > limit:
-            return text[:limit]
-        return text
-
-    def _mark_alarm_failed(self, db: Session, alarm_id: int, message: str):
-        alarm = db.query(AlarmRecord).filter(AlarmRecord.id == alarm_id).first()
-        if not alarm:
-            return
-
-        alarm.recording_status = "failed"
-        alarm.recording_error = self._normalize_error_text(message)
-
-        try:
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            logger.error(f"更新报警失败状态失败 alarm_id={alarm_id}: {e}")
-
-    def _export_clip_with_fallback(self, temp_list_file: str, output_path: str, offset_seconds: int, duration_seconds: int):
-        ffmpeg_path = self._get_ffmpeg_path()
-
-        # 首选：无损拷贝（最快）
-        copy_cmd = [
-            ffmpeg_path,
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", temp_list_file,
-            "-ss", str(max(0, int(offset_seconds))),
-            "-t", str(max(1, int(duration_seconds))),
-            "-c", "copy",
-            output_path,
-        ]
-
-        ok, err = self._run_ffmpeg(copy_cmd)
-        if ok and os.path.exists(output_path) and os.path.getsize(output_path) > 64 * 1024:
-            return True, None
-
-        # 兜底：容错重编码，忽略坏包，同时丢弃音频规避 AAC 坏帧影响
-        reencode_cmd = [
-            ffmpeg_path,
-            "-y",
-            "-fflags", "+discardcorrupt+genpts",
-            "-err_detect", "ignore_err",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", temp_list_file,
-            "-ss", str(max(0, int(offset_seconds))),
-            "-t", str(max(1, int(duration_seconds))),
-            "-an",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "24",
-            "-movflags", "+faststart",
-            output_path,
-        ]
-
-        ok2, err2 = self._run_ffmpeg(reencode_cmd)
-        if ok2 and os.path.exists(output_path) and os.path.getsize(output_path) > 64 * 1024:
-            return True, None
-
-        return False, f"copy_failed={err or 'unknown'} | reencode_failed={err2 or 'unknown'}"
-
-    def _collect_segments_for_window(self, video_id: int, start_time: datetime, end_time: datetime) -> List[str]:
-        record_root = self._get_record_root()
-        device_root = os.path.join(record_root, str(video_id))
-        if not os.path.exists(device_root):
-            return []
-
-        matched = []
-        for day_dir, _, files in os.walk(device_root):
-            for f in files:
-                if not f.lower().endswith(".mp4"):
-                    continue
-                full_path = os.path.join(day_dir, f)
-                seg_start = self._parse_segment_start(full_path)
-                if not seg_start:
-                    continue
-                if not self._is_segment_usable(full_path):
-                    continue
-                seg_end = seg_start + timedelta(seconds=60)
-                if seg_end >= start_time and seg_start <= end_time:
-                    matched.append(full_path)
-
-        matched.sort()
-        return matched
-
-    def build_alarm_clip(self, alarm_id: int, seconds_before: int = 120, seconds_after: int = 120):
-        db = SessionLocal()
-        temp_list_file = None
-
-        try:
-            alarm = db.query(AlarmRecord).filter(AlarmRecord.id == alarm_id).first()
-            if not alarm:
-                return False
-
-            if not alarm.device_id:
-                self._mark_alarm_failed(db, alarm_id, "报警未关联摄像头")
-                return False
-
-            try:
-                video_id = int(alarm.device_id)
-            except Exception:
-                self._mark_alarm_failed(db, alarm_id, f"无效摄像头ID: {alarm.device_id}")
-                return False
-
-            alarm_time = alarm.timestamp or datetime.now()
-            clip_start = alarm_time - timedelta(seconds=seconds_before)
-            clip_end = alarm_time + timedelta(seconds=seconds_after)
-
-            segments = self._collect_segments_for_window(video_id, clip_start, clip_end)
-            if not segments:
-                self._mark_alarm_failed(db, alarm_id, "未找到可用录像分段")
-                return False
-
-            alarm_root = self._get_alarm_video_root()
-            device_alarm_root = os.path.join(alarm_root, str(video_id))
-            os.makedirs(device_alarm_root, exist_ok=True)
-
-            output_name = f"{alarm_time.strftime('%Y%m%d_%H%M%S')}_alarm_{alarm.id}.mp4"
-            output_path = os.path.join(device_alarm_root, output_name)
-
-            temp_list_file = os.path.join(device_alarm_root, f"concat_{alarm.id}.txt")
-            with open(temp_list_file, "w", encoding="utf-8") as f:
-                for seg in segments:
-                    safe_path = seg.replace("\\", "/").replace("'", "'\\''")
-                    f.write(f"file '{safe_path}'\n")
-
-            offset_seconds = max(0, (clip_start - self._parse_segment_start(segments[0])).total_seconds())
-            duration_seconds = seconds_before + seconds_after
-
-            ok, export_error = self._export_clip_with_fallback(
-                temp_list_file=temp_list_file,
-                output_path=output_path,
-                offset_seconds=int(offset_seconds),
-                duration_seconds=int(duration_seconds),
-            )
-            if not ok:
-                raise RuntimeError(f"报警片段导出失败: {export_error}")
-
-            rel_path = f"/static/alarm_videos/{video_id}/{output_name}"
-            alarm.recording_path = rel_path
-            alarm.recording_status = "ready"
-            alarm.recording_error = None
-            db.commit()
-            return True
-
-        except Exception as e:
-            logger.error(f"生成报警片段失败 alarm_id={alarm_id}: {e}")
-            self._mark_alarm_failed(db, alarm_id, str(e))
-            return False
-        finally:
-            if temp_list_file and os.path.exists(temp_list_file):
-                try:
-                    os.remove(temp_list_file)
-                except Exception:
-                    pass
-            db.close()
-
     def ensure_all_recordings(self, db: Session):
         videos = db.query(VideoDevice).all()
         for v in videos:
@@ -828,88 +991,168 @@ class VideoService:
             if rtsp_url:
                 self.start_ffmpeg_recording(v.id, rtsp_url)
 
-    def build_alarm_clip_delayed(self, alarm_id: int, seconds_before: int = 120, seconds_after: int = 120):
-        # 给“后置时段”留出时间，同时对仍在写入分段增加重试，降低 concat 失败率。
-        time.sleep(seconds_after + 2)
+    def _parse_datetime_input(self, value: datetime | str) -> datetime:
+        if isinstance(value, datetime):
+            return value
 
-        max_attempts = 3
-        for i in range(max_attempts):
-            ok = self.build_alarm_clip(alarm_id, seconds_before, seconds_after)
-            if ok:
-                return True
-            if i < max_attempts - 1:
-                time.sleep(20)
+        if not isinstance(value, str):
+            raise ValueError("时间参数格式不正确")
 
-        return False
+        raw = value.strip()
+        if not raw:
+            raise ValueError("时间参数不能为空")
 
-    def save_playback_clip(self, video_id: int, start_time: datetime, end_time: datetime):
-        temp_list_file = None
+        normalized = raw.replace(" ", "T")
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
 
         try:
-            if end_time <= start_time:
-                raise ValueError("结束时间必须大于开始时间")
+            dt = datetime.fromisoformat(normalized)
+        except ValueError:
+            raise ValueError("时间格式无效，支持 ISO 格式，如 2026-03-24T09:47:00")
 
-            # 统一转换为本地无时区时间，避免与分段文件名(本地时间)比较时出现偏差
-            if start_time.tzinfo:
-                start_time = start_time.astimezone().replace(tzinfo=None)
-            if end_time.tzinfo:
-                end_time = end_time.astimezone().replace(tzinfo=None)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
 
-            duration_seconds = int((end_time - start_time).total_seconds())
-            if duration_seconds <= 0:
-                raise ValueError("保存时长无效")
-            if duration_seconds > 6 * 3600:
-                raise ValueError("单次保存时长不能超过6小时")
+    def _to_static_web_path(self, abs_file_path: str) -> str:
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        static_root = os.path.join(base_dir, "static")
+        rel_path = os.path.relpath(abs_file_path, static_root)
+        return "/static/" + rel_path.replace("\\", "/")
 
-            segments = self._collect_segments_for_window(video_id, start_time, end_time)
-            if not segments:
-                raise ValueError("该时间段未找到可用录像分段")
+    def _collect_segments_for_timerange(self, video_id: int, start_dt: datetime, end_dt: datetime) -> list[tuple[str, datetime, datetime]]:
+        record_root = self._get_record_root()
+        device_root = os.path.join(record_root, str(video_id))
+        if not os.path.isdir(device_root):
+            return []
 
-            first_seg_start = self._parse_segment_start(segments[0])
-            if not first_seg_start:
-                raise ValueError("录像分段时间解析失败")
+        candidates: list[tuple[str, datetime, datetime]] = []
+        for seg_path in sorted(glob.glob(os.path.join(device_root, "*.mp4"))):
+            seg_start = self._parse_segment_start(seg_path)
+            if not seg_start:
+                continue
 
-            playback_root = self._get_playback_video_root()
-            device_playback_root = os.path.join(playback_root, str(video_id))
-            os.makedirs(device_playback_root, exist_ok=True)
+            seg_end = seg_start + timedelta(seconds=60)
+            if seg_end <= start_dt or seg_start >= end_dt:
+                continue
+            if not self._is_segment_usable(seg_path):
+                continue
 
-            output_name = (
-                f"{start_time.strftime('%Y%m%d_%H%M%S')}"
-                f"_{end_time.strftime('%Y%m%d_%H%M%S')}"
-                ".mp4"
-            )
-            output_path = os.path.join(device_playback_root, output_name)
+            candidates.append((seg_path, seg_start, seg_end))
 
-            temp_list_file = os.path.join(
-                device_playback_root,
-                f"concat_{video_id}_{int(time.time())}.txt"
-            )
-            with open(temp_list_file, "w", encoding="utf-8") as f:
-                for seg in segments:
-                    safe_path = seg.replace("\\", "/").replace("'", "'\\''")
-                    f.write(f"file '{safe_path}'\n")
+        return candidates
 
-            offset_seconds = max(0, int((start_time - first_seg_start).total_seconds()))
+    def save_playback_clip(self, video_id: int, start_time: datetime | str, end_time: datetime | str, output_type: str = "playback", filename_prefix: Optional[str] = None):
+        start_dt = self._parse_datetime_input(start_time)
+        end_dt = self._parse_datetime_input(end_time)
+        if end_dt <= start_dt:
+            raise ValueError("结束时间必须大于开始时间")
 
-            ok, export_error = self._export_clip_with_fallback(
-                temp_list_file=temp_list_file,
-                output_path=output_path,
-                offset_seconds=offset_seconds,
-                duration_seconds=duration_seconds,
-            )
-            if not ok:
-                raise ValueError(f"回放导出失败: {export_error}")
+        segments = self._collect_segments_for_timerange(video_id, start_dt, end_dt)
+        if not segments:
+            raise ValueError("所选时间段没有可用录像分段")
+
+        output_root = self._get_alarm_video_root() if output_type == "alarm" else self._get_playback_video_root()
+        os.makedirs(output_root, exist_ok=True)
+
+        ffmpeg_path = self._get_ffmpeg_path()
+        if not os.path.exists(ffmpeg_path):
+            raise ValueError(f"未找到 ffmpeg: {ffmpeg_path}")
+
+        first_seg_start = segments[0][1]
+        concat_list_path = os.path.join(output_root, f"_concat_{video_id}_{uuid.uuid4().hex}.txt")
+        concat_output_path = os.path.join(output_root, f"_concat_{video_id}_{uuid.uuid4().hex}.mp4")
+
+        safe_prefix = (filename_prefix or "playback").replace(" ", "_")
+        final_name = f"{safe_prefix}_{video_id}_{start_dt.strftime('%Y%m%d_%H%M%S')}_{end_dt.strftime('%Y%m%d_%H%M%S')}.mp4"
+        final_output_path = os.path.join(output_root, final_name)
+
+        try:
+            with open(concat_list_path, "w", encoding="utf-8") as f:
+                for seg_path, _, _ in segments:
+                    safe_seg_path = seg_path.replace("\\", "/").replace("'", "\\'")
+                    f.write(f"file '{safe_seg_path}'\n")
+
+            concat_cmd = [
+                ffmpeg_path,
+                "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_list_path,
+                "-c", "copy",
+                concat_output_path,
+            ]
+            concat_proc = subprocess.run(concat_cmd, capture_output=True, text=True)
+            if concat_proc.returncode != 0:
+                concat_fallback_cmd = [
+                    ffmpeg_path,
+                    "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", concat_list_path,
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-c:a", "aac",
+                    concat_output_path,
+                ]
+                concat_fallback_proc = subprocess.run(concat_fallback_cmd, capture_output=True, text=True)
+                if concat_fallback_proc.returncode != 0:
+                    logger.error(
+                        "Concat failed video_id=%s start=%s end=%s copy_err=%s reencode_err=%s",
+                        video_id,
+                        start_dt,
+                        end_dt,
+                        (concat_proc.stderr or "").strip()[-1200:],
+                        (concat_fallback_proc.stderr or "").strip()[-1200:],
+                    )
+                    raise ValueError("录像分段合并失败")
+
+            clip_offset = max(0.0, (start_dt - first_seg_start).total_seconds())
+            clip_duration = max(1.0, (end_dt - start_dt).total_seconds())
+
+            trim_cmd = [
+                ffmpeg_path,
+                "-y",
+                "-ss", f"{clip_offset:.3f}",
+                "-i", concat_output_path,
+                "-t", f"{clip_duration:.3f}",
+                "-c", "copy",
+                final_output_path,
+            ]
+            trim_proc = subprocess.run(trim_cmd, capture_output=True, text=True)
+            if trim_proc.returncode != 0:
+                trim_fallback_cmd = [
+                    ffmpeg_path,
+                    "-y",
+                    "-ss", f"{clip_offset:.3f}",
+                    "-i", concat_output_path,
+                    "-t", f"{clip_duration:.3f}",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-c:a", "aac",
+                    final_output_path,
+                ]
+                trim_fallback_proc = subprocess.run(trim_fallback_cmd, capture_output=True, text=True)
+                if trim_fallback_proc.returncode != 0:
+                    raise ValueError("录像裁剪失败")
+
+            if not os.path.exists(final_output_path) or os.path.getsize(final_output_path) == 0:
+                raise ValueError("生成的视频文件无效")
 
             return {
+                "status": "success",
                 "video_id": video_id,
-                "start_time": start_time.isoformat(sep=" "),
-                "end_time": end_time.isoformat(sep=" "),
-                "duration_seconds": duration_seconds,
-                "recording_path": f"/static/playback_videos/{video_id}/{output_name}",
+                "start_time": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "end_time": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "duration_seconds": int((end_dt - start_dt).total_seconds()),
+                "recording_path": self._to_static_web_path(final_output_path),
+                "recording_full_path": final_output_path,
             }
         finally:
-            if temp_list_file and os.path.exists(temp_list_file):
+            for temp_file in [concat_list_path, concat_output_path]:
                 try:
-                    os.remove(temp_list_file)
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
                 except Exception:
                     pass

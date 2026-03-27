@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Search,
   Plus,
@@ -15,6 +15,7 @@ import {
   LayoutGrid,
   Loader,
   Settings,
+  Save,
   Edit2,
   // --- ✅ 新增图标（已合并，无重复）---
   Shield,
@@ -38,8 +39,21 @@ import {
   startAIMonitoring,
   stopAIMonitoring,
   getAIRules,
+  savePlaybackClip,
   AIRule,
 } from "../src/api/videoApi";
+import { API_BASE_URL } from "../src/api/config";
+
+const getAlarmWebSocketUrl = () => {
+  try {
+    const apiUrl = new URL(API_BASE_URL);
+    const wsProtocol = apiUrl.protocol === "https:" ? "wss:" : "ws:";
+    return `${wsProtocol}//${apiUrl.host}/ws/alarm`;
+  } catch {
+    const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${wsProtocol}//${window.location.hostname}:9000/ws/alarm`;
+  }
+};
 
 const VIDEO_CENTER_STYLE_ID = "video-center-cyber-style";
 if (typeof document !== "undefined" && !document.getElementById(VIDEO_CENTER_STYLE_ID)) {
@@ -111,6 +125,14 @@ function CyberPanel({
 }
 
 export default function VideoCenter() {
+  type AlarmBox = {
+    type: string;
+    msg: string;
+    score: number;
+    coords: [number, number, number, number];
+    track_id: number;
+  };
+
   // --- 状态管理 ---
   const [activeAlgos, setActiveAlgos] = useState<string[]>([]); 
   const [algos, setAlgos] = useState<Array<{ id: string; name: string }>>([
@@ -132,6 +154,15 @@ export default function VideoCenter() {
   const [isAIEnabled, setIsAIEnabled] = useState(false);
   const [aiLoading, setAiLoading] = useState(false);
 
+  // --- ✅ 新增：警报弹窗状态 ---
+  const [alarmAlert, setAlarmAlert] = useState<{
+    type: string;
+    msg: string;
+    score: number;
+    timestamp: number;
+  } | null>(null);
+  const [alarmBoxes, setAlarmBoxes] = useState<AlarmBox[]>([]);
+
   // --- 分页与网格状态 ---
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage, setItemsPerPage] = useState(9);
@@ -145,6 +176,15 @@ export default function VideoCenter() {
   const [showEditModal, setShowEditModal] = useState(false);
   const [selectedDevice, setSelectedDevice] = useState<Video | null>(null);
   const [editingDevice, setEditingDevice] = useState<Video | null>(null);
+  const [playbackStartTime, setPlaybackStartTime] = useState("");
+  const [playbackEndTime, setPlaybackEndTime] = useState("");
+  const [playbackSaving, setPlaybackSaving] = useState(false);
+  const [playbackSavedPath, setPlaybackSavedPath] = useState<string | null>(null);
+  const alarmWsRef = useRef<WebSocket | null>(null);
+  const alarmReconnectTimerRef = useRef<number | null>(null);
+  const alarmCloseTimerRef = useRef<number | null>(null);
+  const alarmBoxesClearTimerRef = useRef<number | null>(null);
+  const aiCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [newDeviceForm, setNewDeviceForm] = useState<VideoCreate>({
     name: "",
@@ -173,6 +213,29 @@ export default function VideoCenter() {
     setIsAIEnabled(false);
   }, [maximizedVideo]);
 
+  useEffect(() => {
+    if (!maximizedVideo) {
+      setPlaybackSavedPath(null);
+      return;
+    }
+
+    const toInputValue = (d: Date) => {
+      const pad = (v: number) => String(v).padStart(2, "0");
+      const year = d.getFullYear();
+      const month = pad(d.getMonth() + 1);
+      const day = pad(d.getDate());
+      const hour = pad(d.getHours());
+      const minute = pad(d.getMinutes());
+      return `${year}-${month}-${day}T${hour}:${minute}`;
+    };
+
+    const now = new Date();
+    const tenMinutesAgo = new Date(now.getTime() - 10 * 60 * 1000);
+    setPlaybackStartTime(toInputValue(tenMinutesAgo));
+    setPlaybackEndTime(toInputValue(now));
+    setPlaybackSavedPath(null);
+  }, [maximizedVideo]);
+
   // --- ✅ 改进：AI 开关处理逻辑 ---
 
   // 1. 处理单个功能的开启/关闭
@@ -182,7 +245,12 @@ export default function VideoCenter() {
 
   try {
     const deviceId = String(maximizedVideo.id);
-    const rtsp = maximizedVideo.stream_url || maximizedVideo.rtsp_url || "";
+    const rtsp = maximizedVideo.rtsp_url || "";
+
+    if (!rtsp || !rtsp.toLowerCase().startsWith("rtsp://")) {
+      alert("当前设备缺少有效 RTSP 地址，请先编辑设备并填写 RTSP 流地址");
+      return;
+    }
 
     const nextAlgos = activeAlgos.includes(type)
       ? activeAlgos.filter(t => t !== type)
@@ -211,7 +279,12 @@ export default function VideoCenter() {
 
   try {
     const deviceId = String(maximizedVideo.id);
-    const rtsp = maximizedVideo.stream_url || maximizedVideo.rtsp_url || "";
+    const rtsp = maximizedVideo.rtsp_url || "";
+
+    if (!rtsp || !rtsp.toLowerCase().startsWith("rtsp://")) {
+      alert("当前设备缺少有效 RTSP 地址，请先编辑设备并填写 RTSP 流地址");
+      return;
+    }
 
     await stopAIMonitoring(deviceId);
 
@@ -236,6 +309,36 @@ export default function VideoCenter() {
     fetchAIRules();
   }, []);
 
+  // ✅ 新增：播放警报音效
+  const playAlarmSound = () => {
+    // 创建简单的蜂鸣音（使用Web Audio API）
+    try {
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const now = audioContext.currentTime;
+      
+      // 创建4个频率的警报音
+      for (let i = 0; i < 4; i++) {
+        const osc = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        
+        osc.connect(gain);
+        gain.connect(audioContext.destination);
+        
+        // 快速升降的频率
+        osc.frequency.setValueAtTime(800 + i * 200, now + i * 0.15);
+        osc.frequency.setValueAtTime(400 + i * 100, now + i * 0.15 + 0.1);
+        
+        gain.gain.setValueAtTime(0.3, now + i * 0.15);
+        gain.gain.setValueAtTime(0, now + i * 0.15 + 0.12);
+        
+        osc.start(now + i * 0.15);
+        osc.stop(now + i * 0.15 + 0.12);
+      }
+    } catch (err) {
+      console.warn("音频上下文创建失败:", err);
+    }
+  };
+
   const fetchAIRules = async () => {
     try {
       const rules: AIRule[] = await getAIRules();
@@ -252,35 +355,190 @@ export default function VideoCenter() {
     }
   };
 
-  useEffect(() => {
+  const normalizeSingleAlarmBox = (raw: any, fallback: any): AlarmBox | null => {
+    if (!raw || typeof raw !== "object") return null;
 
-    const ws = new WebSocket("ws://localhost:8000/ws/alarm")
+    let coordsSource =
+      raw.coords ||
+      raw.bbox ||
+      raw.xyxy ||
+      raw.box ||
+      (raw.rect && [raw.rect.left, raw.rect.top, raw.rect.right, raw.rect.bottom]);
 
-    ws.onopen = () => {
-      console.log("AI报警WebSocket已连接")
+    if (!Array.isArray(coordsSource) || coordsSource.length < 4) {
+      const x1 = Number(raw.x1 ?? raw.left ?? raw.x ?? 0);
+      const y1 = Number(raw.y1 ?? raw.top ?? raw.y ?? 0);
+      const x2 = Number(raw.x2 ?? raw.right ?? (Number(raw.w) ? x1 + Number(raw.w) : 0));
+      const y2 = Number(raw.y2 ?? raw.bottom ?? (Number(raw.h) ? y1 + Number(raw.h) : 0));
+      coordsSource = [x1, y1, x2, y2];
     }
 
-    ws.onmessage = (event) => {
+    const numericCoords = coordsSource.map((v: any) => Number(v)).filter(Number.isFinite);
+    if (numericCoords.length < 4) return null;
 
-      const data = JSON.parse(event.data)
+    let x1 = numericCoords[0];
+    let y1 = numericCoords[1];
+    let x2 = numericCoords[2];
+    let y2 = numericCoords[3];
 
-      if (data.alarm && data.boxes) {
-        drawBoxes(data.boxes)
+    if (x2 < x1) [x1, x2] = [x2, x1];
+    if (y2 < y1) [y1, y2] = [y2, y1];
+
+    return {
+      type: raw.type || fallback?.type || "未知警报",
+      msg: raw.msg || fallback?.msg || "检测到异常",
+      score: Number.isFinite(Number(raw.score)) ? Number(raw.score) : Number(fallback?.score) || 0,
+      coords: [x1, y1, x2, y2],
+      track_id: Number(raw.track_id ?? fallback?.track_id ?? 0),
+    };
+  };
+
+  const normalizeAlarmBoxes = (data: any): AlarmBox[] => {
+    if (!data || typeof data !== "object") return [];
+
+    const candidates = [
+      data.boxes,
+      data.data?.boxes,
+      data.payload?.boxes,
+      data.detail?.boxes,
+      data.result?.boxes,
+      data.event?.boxes,
+    ];
+
+    for (const candidate of candidates) {
+      if (!Array.isArray(candidate) || candidate.length === 0) continue;
+      const normalized = candidate
+        .map((box: any) => normalizeSingleAlarmBox(box, data))
+        .filter((box: AlarmBox | null): box is AlarmBox => Boolean(box));
+      if (normalized.length > 0) return normalized;
+    }
+
+    const flatBox = normalizeSingleAlarmBox(data, data);
+    if (flatBox) return [flatBox];
+
+    return [];
+  };
+
+  const parseAlarmPayload = (raw: any): { boxes: AlarmBox[]; alarmLike: any } => {
+    const alarmLike = (raw?.data && typeof raw.data === "object" ? raw.data : raw) || {};
+    const boxes = normalizeAlarmBoxes(raw);
+    return { boxes, alarmLike };
+  };
+
+  useEffect(() => {
+    const wsUrl = getAlarmWebSocketUrl();
+    let disposed = false;
+
+    const connect = () => {
+      if (disposed) return;
+
+      try {
+        if (alarmWsRef.current) {
+          alarmWsRef.current.close();
+          alarmWsRef.current = null;
+        }
+
+        const ws = new WebSocket(wsUrl);
+        alarmWsRef.current = ws;
+
+        ws.onopen = () => {
+          console.log("AI报警WebSocket已连接:", wsUrl);
+        };
+
+        ws.onmessage = (event) => {
+          let data: any;
+          try {
+            data = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+          } catch {
+            return;
+          }
+
+          const { boxes, alarmLike } = parseAlarmPayload(data);
+          const isAlarm = Boolean(
+            boxes.length ||
+              alarmLike?.alarm ||
+              alarmLike?.is_alarm ||
+              alarmLike?.alert ||
+              alarmLike?.msg ||
+              alarmLike?.type
+          );
+          if (!isAlarm) return;
+
+          if (boxes.length) {
+            setAlarmBoxes(boxes);
+
+            if (alarmBoxesClearTimerRef.current) {
+              window.clearTimeout(alarmBoxesClearTimerRef.current);
+            }
+            alarmBoxesClearTimerRef.current = window.setTimeout(() => {
+              setAlarmBoxes([]);
+            }, 4200);
+          }
+
+          const firstBox = boxes[0];
+          setAlarmAlert({
+            type: firstBox?.type || alarmLike?.type || "未知警报",
+            msg: firstBox?.msg || alarmLike?.msg || "检测到异常",
+            score: Number(firstBox?.score ?? alarmLike?.score ?? 0) || 0,
+            timestamp: Date.now(),
+          });
+
+          playAlarmSound();
+
+          if (alarmCloseTimerRef.current) {
+            window.clearTimeout(alarmCloseTimerRef.current);
+          }
+          alarmCloseTimerRef.current = window.setTimeout(() => {
+            setAlarmAlert(null);
+          }, 3000);
+        };
+
+        ws.onerror = (err) => {
+          console.error("AI WebSocket错误:", err);
+        };
+
+        ws.onclose = () => {
+          console.log("AI报警连接关闭，准备重连");
+          if (disposed) return;
+          if (alarmReconnectTimerRef.current) {
+            window.clearTimeout(alarmReconnectTimerRef.current);
+          }
+          alarmReconnectTimerRef.current = window.setTimeout(connect, 2000);
+        };
+      } catch (err) {
+        console.error("AI WebSocket连接初始化失败:", err);
+      }
+    };
+
+    connect();
+
+    return () => {
+      disposed = true;
+
+      if (alarmReconnectTimerRef.current) {
+        window.clearTimeout(alarmReconnectTimerRef.current);
+        alarmReconnectTimerRef.current = null;
+      }
+      if (alarmCloseTimerRef.current) {
+        window.clearTimeout(alarmCloseTimerRef.current);
+        alarmCloseTimerRef.current = null;
+      }
+      if (alarmBoxesClearTimerRef.current) {
+        window.clearTimeout(alarmBoxesClearTimerRef.current);
+        alarmBoxesClearTimerRef.current = null;
       }
 
-    }
+      if (alarmWsRef.current) {
+        alarmWsRef.current.close();
+        alarmWsRef.current = null;
+      }
+    };
+  }, []);
 
-    ws.onerror = (err) => {
-      console.error("AI WebSocket错误:", err)
-    }
-
-    ws.onclose = () => {
-      console.log("AI报警连接关闭")
-    }
-
-    return () => ws.close()
-
-  }, [])
+  const formatLocalDateTimeForApi = (date: Date) => {
+    const pad = (v: number) => String(v).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  };
 
   const fetchDevices = async () => {
     try {
@@ -421,7 +679,7 @@ export default function VideoCenter() {
       port: device.port,
       username: device.username || "",
       password: device.password || "",
-      stream_url: device.stream_url || "",
+      stream_url: device.rtsp_url || "",
       status: device.status,
       remark: device.remark || "",
     });
@@ -436,7 +694,11 @@ export default function VideoCenter() {
     }
 
     try {
-      const updatedDevice = await updateVideo(editingDevice.id, editDeviceForm);
+      const updatedDevice = await updateVideo(editingDevice.id, {
+        ...editDeviceForm,
+        rtsp_url: editDeviceForm.stream_url,
+        stream_url: undefined,
+      });
       setDevices(
         devices.map((d) => (d.id === editingDevice.id ? updatedDevice : d))
       );
@@ -459,7 +721,167 @@ export default function VideoCenter() {
     }
   };
 
+  const handleSavePlayback = async () => {
+    if (!maximizedVideo) {
+      alert("请先选择摄像头");
+      return;
+    }
+
+    if (!playbackStartTime || !playbackEndTime) {
+      alert("请先选择开始和结束时间");
+      return;
+    }
+
+    const startDate = new Date(playbackStartTime);
+    const endDate = new Date(playbackEndTime);
+
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+      alert("时间格式无效");
+      return;
+    }
+
+    if (endDate <= startDate) {
+      alert("结束时间必须大于开始时间");
+      return;
+    }
+
+    try {
+      setPlaybackSaving(true);
+      const resp = await savePlaybackClip(maximizedVideo.id, {
+        start_time: formatLocalDateTimeForApi(startDate),
+        end_time: formatLocalDateTimeForApi(endDate),
+      });
+      setPlaybackSavedPath(resp.recording_path);
+      alert("回放保存成功");
+    } catch (e: any) {
+      alert(`回放保存失败: ${e?.message || "未知错误"}`);
+    } finally {
+      setPlaybackSaving(false);
+    }
+  };
+
   const cols = Math.ceil(Math.sqrt(itemsPerPage));
+
+    const drawBoxes = useCallback((boxes: AlarmBox[]) => {
+      const canvas = aiCanvasRef.current;
+      if (!canvas) return;
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      const container = canvas.parentElement;
+      const videoEl = container?.querySelector("video") as HTMLVideoElement | null;
+
+      canvas.width = canvas.offsetWidth;
+      canvas.height = canvas.offsetHeight;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const rawVideoW = videoEl?.videoWidth || 0;
+      const rawVideoH = videoEl?.videoHeight || 0;
+
+      // 视频元数据未就绪时，依据告警坐标范围做自适应缩放，避免框被画到可视区外
+      const maxCoordX = boxes.reduce((m, b) => Math.max(m, b.coords[0], b.coords[2]), 0);
+      const maxCoordY = boxes.reduce((m, b) => Math.max(m, b.coords[1], b.coords[3]), 0);
+      const inferredSourceW = Math.max(canvas.width, maxCoordX + 1);
+      const inferredSourceH = Math.max(canvas.height, maxCoordY + 1);
+
+      let renderX = 0;
+      let renderY = 0;
+      let renderW = canvas.width;
+      let renderH = canvas.height;
+
+      if (rawVideoW > 0 && rawVideoH > 0) {
+        const videoAspect = rawVideoW / rawVideoH;
+        const canvasAspect = canvas.width / canvas.height;
+
+        if (videoAspect > canvasAspect) {
+          renderW = canvas.width;
+          renderH = canvas.width / videoAspect;
+          renderY = (canvas.height - renderH) / 2;
+        } else {
+          renderH = canvas.height;
+          renderW = canvas.height * videoAspect;
+          renderX = (canvas.width - renderW) / 2;
+        }
+      }
+
+      boxes.forEach((box) => {
+        const coords = Array.isArray(box?.coords) ? box.coords : null;
+        if (!coords || coords.length < 4) return;
+
+        let [x1, y1, x2, y2] = coords.map((v: any) => Number(v));
+        if (![x1, y1, x2, y2].every(Number.isFinite)) return;
+
+        const isNormalized = x2 <= 1.5 && y2 <= 1.5 && x1 >= 0 && y1 >= 0;
+        if (isNormalized) {
+          x1 *= rawVideoW || 1;
+          y1 *= rawVideoH || 1;
+          x2 *= rawVideoW || 1;
+          y2 *= rawVideoH || 1;
+        }
+
+        const sourceW = rawVideoW || inferredSourceW;
+        const sourceH = rawVideoH || inferredSourceH;
+        const scaleX = renderW / sourceW;
+        const scaleY = renderH / sourceH;
+
+        const drawX = renderX + x1 * scaleX;
+        const drawY = renderY + y1 * scaleY;
+        const drawW = Math.max(2, (x2 - x1) * scaleX);
+        const drawH = Math.max(2, (y2 - y1) * scaleY);
+
+        const id = Number(box.track_id || 0);
+        const color = `hsl(${(id * 50) % 360}, 80%, 50%)`;
+        const label = `${box.msg || box.type || "报警"} #${id}`;
+
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 3;
+        ctx.strokeRect(drawX, drawY, drawW, drawH);
+
+        ctx.font = "14px Arial";
+        const textWidth = ctx.measureText(label).width;
+        const tagW = Math.min(Math.max(textWidth + 12, 90), 280);
+        const tagH = 22;
+        const tagX = Math.max(0, Math.min(drawX, canvas.width - tagW));
+        const tagY = Math.max(0, drawY - tagH - 2);
+
+        ctx.fillStyle = color;
+        ctx.fillRect(tagX, tagY, tagW, tagH);
+        ctx.fillStyle = "white";
+        ctx.fillText(label, tagX + 6, tagY + 15);
+      });
+    }, []);
+
+  useEffect(() => {
+    if (!maximizedVideo || !streamUrl || !alarmBoxes.length) {
+      const canvas = aiCanvasRef.current;
+      const ctx = canvas?.getContext("2d");
+      if (canvas && ctx) {
+        canvas.width = canvas.offsetWidth;
+        canvas.height = canvas.offsetHeight;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      return;
+    }
+
+    const redraw = () => drawBoxes(alarmBoxes);
+    redraw();
+
+    // 初始几秒重复重绘，覆盖视频元数据异步加载导致的坐标偏移
+    const warmupTimer = window.setInterval(redraw, 400);
+    const stopWarmupTimer = window.setTimeout(() => {
+      window.clearInterval(warmupTimer);
+    }, 3000);
+
+    const resizeHandler = () => redraw();
+    window.addEventListener("resize", resizeHandler);
+
+    return () => {
+      window.removeEventListener("resize", resizeHandler);
+      window.clearInterval(warmupTimer);
+      window.clearTimeout(stopWarmupTimer);
+    };
+  }, [alarmBoxes, drawBoxes, maximizedVideo, streamUrl]);
 
   if (loading)
     return (
@@ -468,45 +890,63 @@ export default function VideoCenter() {
       </div>
     );
 
-    const trackHistory:any = {}
-
-    const drawBoxes = (boxes:any[]) => {
-
-      const canvas:any = document.getElementById("aiCanvas")
-      if(!canvas) return
-
-      const ctx = canvas.getContext("2d")
-
-      canvas.width = canvas.offsetWidth
-      canvas.height = canvas.offsetHeight
-
-      ctx.clearRect(0,0,canvas.width,canvas.height)
-
-      boxes.forEach((box)=>{
-
-        const [x1,y1,x2,y2] = box.coords
-        const id = box.track_id || 0
-
-        const color = `hsl(${(id*50)%360},80%,50%)`
-
-        ctx.strokeStyle=color
-        ctx.lineWidth=3
-
-        ctx.strokeRect(x1,y1,x2-x1,y2-y1)
-
-        ctx.fillStyle=color
-        ctx.fillRect(x1,y1-20,120,20)
-
-        ctx.fillStyle="white"
-        ctx.font="14px Arial"
-        ctx.fillText(`${box.msg} #${id}`,x1+5,y1-5)
-
-      })
-
-    }
-
   return (
     <div className="h-full flex gap-4 p-4 text-slate-100 bg-[radial-gradient(circle_at_12%_8%,rgba(56,189,248,0.20),transparent_32%),radial-gradient(circle_at_86%_2%,rgba(59,130,246,0.22),transparent_30%),linear-gradient(135deg,#020617,#0b1f3f_45%,#102a5e)]">
+      {/* ✅ 全局警报弹窗 - 显示在最前面 */}
+      {alarmAlert && (
+        <div className="fixed inset-0 z-[999] flex items-center justify-center pointer-events-auto">
+          <div className="relative max-w-md">
+            {/* 外层脉冲光环 */}
+            <div className="absolute inset-0 bg-gradient-to-r from-red-500/40 via-orange-500/40 to-red-500/40 rounded-2xl blur-2xl animate-pulse" />
+            
+            {/* 主弹窗容器 */}
+            <div className="relative bg-gradient-to-br from-slate-950 via-red-950/40 to-slate-950 border-2 border-red-500/60 rounded-2xl shadow-2xl p-8 backdrop-blur-xl">
+              {/* 警报图标动画 */}
+              <div className="flex justify-center mb-4">
+                <div className="relative">
+                  <div className="absolute inset-0 bg-red-500/20 rounded-full animate-ping" style={{ animationDuration: '1s' }} />
+                  <div className="relative flex items-center justify-center h-16 w-16 bg-gradient-to-br from-red-500 to-orange-600 rounded-full shadow-lg">
+                    <AlertCircle size={32} className="text-white animate-pulse" />
+                  </div>
+                </div>
+              </div>
+
+              {/* 警报文本 */}
+              <div className="text-center mb-6">
+                <h3 className="text-2xl font-black text-red-400 mb-2">🚨 警报！</h3>
+                <p className="text-lg font-bold text-slate-100 mb-1">{alarmAlert.msg}</p>
+                <div className="flex items-center justify-center gap-3 text-sm">
+                  <span className="px-3 py-1 bg-red-500/30 border border-red-400/60 rounded-full text-red-200 font-semibold">
+                    {alarmAlert.type}
+                  </span>
+                  <span className="px-3 py-1 bg-orange-500/30 border border-orange-400/60 rounded-full text-orange-200 font-semibold">
+                    置信度: {(alarmAlert.score * 100).toFixed(0)}%
+                  </span>
+                </div>
+              </div>
+
+              {/* 闪烁的警告条 */}
+              <div className="mb-4 h-1 bg-gradient-to-r from-red-500 via-orange-500 to-red-500 rounded-full animate-pulse" />
+
+              {/* 关闭按钮 */}
+              <div className="flex justify-center gap-3">
+                <button
+                  onClick={() => setAlarmAlert(null)}
+                  className="px-6 py-2 bg-red-600 hover:bg-red-700 text-white font-bold rounded-lg transition-all hover:scale-105 shadow-lg"
+                >
+                  确认
+                </button>
+              </div>
+
+              {/* 时间戳 */}
+              <div className="mt-3 text-xs text-slate-400 text-center font-mono">
+                {new Date(alarmAlert.timestamp).toLocaleTimeString('zh-CN')}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 左侧列表 */}
       <CyberPanel
         title="设备管理"
@@ -987,8 +1427,13 @@ export default function VideoCenter() {
                       <VideoPlayer src={streamUrl} />
                       <canvas
                       id="aiCanvas"
+                      ref={aiCanvasRef}
                       className="absolute top-0 left-0 w-full h-full pointer-events-none"
                     />
+                      <div className="absolute top-14 left-16 z-20 pointer-events-none flex flex-col gap-0.5 max-w-[45vw] text-black text-lg font-bold leading-7 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)]">
+                        <div className="truncate">{maximizedVideo.name || ""}</div>
+                        <div className="truncate">{maximizedVideo.remark?.trim() || ""}</div>
+                      </div>
                     </div>
                   </div>
                 </>
@@ -1077,6 +1522,51 @@ export default function VideoCenter() {
                     onSuccess={(msg) => console.log(msg)}
                     onError={(err) => console.error(err)}
                   />
+                </div>
+
+                {/* 回放保存 */}
+                <div className="bg-slate-900/75 rounded-lg border border-blue-300/25 p-4 shadow-lg shrink-0">
+                  <div className="flex items-center gap-2 mb-3 text-slate-100 font-semibold">
+                    <Save size={16} className="text-cyan-300" />
+                    回放保存
+                  </div>
+
+                  <div className="space-y-3">
+                    <div>
+                      <label className="text-xs text-slate-300 block mb-1">开始时间</label>
+                      <input
+                        type="datetime-local"
+                        value={playbackStartTime}
+                        onChange={(e) => setPlaybackStartTime(e.target.value)}
+                        className="w-full bg-slate-950/65 border border-blue-300/25 rounded p-2 text-sm text-slate-200 outline-none focus:ring-2 focus:ring-cyan-400/30"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-xs text-slate-300 block mb-1">结束时间</label>
+                      <input
+                        type="datetime-local"
+                        value={playbackEndTime}
+                        onChange={(e) => setPlaybackEndTime(e.target.value)}
+                        className="w-full bg-slate-950/65 border border-blue-300/25 rounded p-2 text-sm text-slate-200 outline-none focus:ring-2 focus:ring-cyan-400/30"
+                      />
+                    </div>
+
+                    <button
+                      onClick={handleSavePlayback}
+                      disabled={playbackSaving}
+                      className="w-full py-2 rounded bg-cyan-500 hover:bg-cyan-400 disabled:opacity-60 text-slate-900 text-sm font-bold transition-colors flex items-center justify-center gap-2"
+                    >
+                      {playbackSaving ? <Loader size={14} className="animate-spin" /> : <Save size={14} />}
+                      {playbackSaving ? "保存中..." : "保存当前回放时段"}
+                    </button>
+
+                    {playbackSavedPath && (
+                      <div className="text-[11px] text-emerald-200 break-all bg-emerald-500/10 border border-emerald-400/20 rounded p-2">
+                        已保存: {playbackSavedPath}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
             )}

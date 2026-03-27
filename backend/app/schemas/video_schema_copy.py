@@ -19,6 +19,7 @@ class VideoBase(BaseModel):
     password: Optional[str] = Field(None, description="登录密码")
     
     stream_url: Optional[str] = Field(None, description="流地址 (RTSP/HLS/FLV)")
+    rtsp_url: Optional[str] = Field(None, description="摄像头RTSP地址")
     
     latitude: Optional[float] = Field(None, description="纬度 (GCJ-02)")
     longitude: Optional[float] = Field(None, description="经度 (GCJ-02)")
@@ -41,6 +42,7 @@ class VideoUpdate(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
     stream_url: Optional[str] = None
+    rtsp_url: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     status: Optional[VideoStatus] = None
@@ -57,6 +59,7 @@ class VideoOut(VideoBase):
     # 兼容历史数据: 某些旧记录可能缺失网络字段，避免响应校验导致 500
     ip_address: Optional[str] = None
     port: Optional[int] = None
+    rtsp_url: Optional[str] = None
     
     # --- 修改部分开始 ---
     # 原代码: status: VideoStatus
@@ -91,6 +94,8 @@ class PTZDirection(str, Enum):
     DOWN = "down"
     LEFT = "left"
     RIGHT = "right"
+    ZOOM_IN = "zoom_in"
+    ZOOM_OUT = "zoom_out"
 
 class PTZControlRequest(BaseModel):
     """
@@ -102,3 +107,23 @@ class PTZControlRequest(BaseModel):
     direction: PTZDirection
     speed: Optional[float] = Field(0.5, ge=0.1, le=1.0)
     duration: Optional[float] = Field(0.5, ge=0.1, le=5.0)
+
+
+class PresetCreateRequest(BaseModel):
+    name: Optional[str] = Field(None, description="预置点名称")
+    token: Optional[str] = Field(None, description="预置点 Token，可选")
+
+
+class PresetGotoRequest(BaseModel):
+    speed: Optional[float] = Field(0.5, ge=0.1, le=1.0)
+
+
+class PTZPresetItem(BaseModel):
+    token: str
+    name: str
+
+
+class CruiseStartRequest(BaseModel):
+    preset_tokens: list[str] = Field(..., min_length=2, description="巡航预置点 Token 列表")
+    dwell_seconds: Optional[float] = Field(8.0, ge=1.0, le=120.0)
+    rounds: Optional[int] = Field(None, ge=1, le=1000, description="巡航轮次，None 表示无限循环")

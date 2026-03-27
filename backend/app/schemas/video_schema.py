@@ -94,6 +94,8 @@ class PTZDirection(str, Enum):
     DOWN = "down"
     LEFT = "left"
     RIGHT = "right"
+    ZOOM_IN = "zoom_in"
+    ZOOM_OUT = "zoom_out"
 
 class PTZControlRequest(BaseModel):
     """
@@ -105,3 +107,35 @@ class PTZControlRequest(BaseModel):
     direction: PTZDirection
     speed: Optional[float] = Field(0.5, ge=0.1, le=1.0)
     duration: Optional[float] = Field(0.5, ge=0.1, le=5.0)
+
+
+class PresetCreateRequest(BaseModel):
+    name: Optional[str] = Field(None, description="预置点名称")
+    token: Optional[str] = Field(None, description="预置点 Token，可选")
+
+
+class PresetGotoRequest(BaseModel):
+    speed: Optional[float] = Field(0.5, ge=0.1, le=1.0)
+
+
+class PTZPresetItem(BaseModel):
+    token: str
+    name: str
+
+
+class PresetBulkDeleteRequest(BaseModel):
+    preset_tokens: list[str] = Field(..., min_length=1, max_length=2000, description="待删除预置点 Token 列表")
+
+
+class PresetBulkDeleteResponse(BaseModel):
+    total: int
+    deleted: int
+    failed: int
+    deleted_tokens: list[str]
+    failed_tokens: list[str]
+
+
+class CruiseStartRequest(BaseModel):
+    preset_tokens: list[str] = Field(..., min_length=2, description="巡航预置点 Token 列表")
+    dwell_seconds: Optional[float] = Field(8.0, ge=1.0, le=120.0)
+    rounds: Optional[int] = Field(None, ge=1, le=1000, description="巡航轮次，None 表示无限循环")

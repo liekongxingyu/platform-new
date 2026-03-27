@@ -55,6 +55,72 @@ const getAlarmWebSocketUrl = () => {
   }
 };
 
+const formatWorkDuration = (seconds?: number) => {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) {
+    return "--";
+  }
+
+  const totalSeconds = Math.floor(seconds);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+};
+
+type VideoWithWorkDuration = Video & {
+  total_work_seconds?: number;
+  total_work_duration_seconds?: number;
+  uptime_seconds?: number;
+  runtime_seconds?: number;
+};
+
+const WORK_DURATION_STORAGE_KEY = "video_center_work_duration_by_device";
+
+const getVideoWorkDurationSeconds = (video?: Video | null) => {
+  if (!video) return undefined;
+
+  const source = video as VideoWithWorkDuration;
+  const candidates = [
+    source.total_work_seconds,
+    source.total_work_duration_seconds,
+    source.uptime_seconds,
+    source.runtime_seconds,
+  ];
+
+  for (const val of candidates) {
+    if (typeof val === "number" && Number.isFinite(val) && val >= 0) {
+      return Math.floor(val);
+    }
+  }
+
+  return undefined;
+};
+
+const loadWorkDurationMap = (): Record<number, number> => {
+  if (typeof window === "undefined") return {};
+
+  try {
+    const raw = window.localStorage.getItem(WORK_DURATION_STORAGE_KEY);
+    if (!raw) return {};
+
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object") return {};
+
+    const result: Record<number, number> = {};
+    for (const [idStr, val] of Object.entries(parsed)) {
+      const id = Number(idStr);
+      const seconds = Number(val);
+      if (Number.isInteger(id) && Number.isFinite(seconds) && seconds >= 0) {
+        result[id] = Math.floor(seconds);
+      }
+    }
+    return result;
+  } catch {
+    return {};
+  }
+};
+
 const VIDEO_CENTER_STYLE_ID = "video-center-cyber-style";
 if (typeof document !== "undefined" && !document.getElementById(VIDEO_CENTER_STYLE_ID)) {
   const styleEl = document.createElement("style");
@@ -125,6 +191,14 @@ function CyberPanel({
 }
 
 export default function VideoCenter() {
+  type AlarmBox = {
+    type: string;
+    msg: string;
+    score: number;
+    coords: [number, number, number, number];
+    track_id: number;
+  };
+
   // --- 状态管理 ---
   const [activeAlgos, setActiveAlgos] = useState<string[]>([]); 
   const [algos, setAlgos] = useState<Array<{ id: string; name: string }>>([
@@ -153,6 +227,7 @@ export default function VideoCenter() {
     score: number;
     timestamp: number;
   } | null>(null);
+  const [alarmBoxes, setAlarmBoxes] = useState<AlarmBox[]>([]);
 
   // --- 分页与网格状态 ---
   const [currentPage, setCurrentPage] = useState(1);
@@ -161,6 +236,7 @@ export default function VideoCenter() {
   const [previewStreams, setPreviewStreams] = useState<Record<number, string>>({});
   const [previewLoading, setPreviewLoading] = useState<Record<number, boolean>>({});
   const [previewErrors, setPreviewErrors] = useState<Record<number, string>>({});
+  const [workDurationByDevice, setWorkDurationByDevice] = useState<Record<number, number>>(loadWorkDurationMap);
 
   // --- 弹窗与表单状态 ---
   const [showAddModal, setShowAddModal] = useState(false);
@@ -174,6 +250,8 @@ export default function VideoCenter() {
   const alarmWsRef = useRef<WebSocket | null>(null);
   const alarmReconnectTimerRef = useRef<number | null>(null);
   const alarmCloseTimerRef = useRef<number | null>(null);
+  const alarmBoxesClearTimerRef = useRef<number | null>(null);
+  const aiCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [newDeviceForm, setNewDeviceForm] = useState<VideoCreate>({
     name: "",
@@ -196,6 +274,82 @@ export default function VideoCenter() {
     status: "offline",
     remark: "",
   });
+
+  const handlePtzSuccess = useCallback((msg: string) => {
+    console.log(msg);
+  }, []);
+
+  const handlePtzError = useCallback((err: string) => {
+    console.error(err);
+  }, []);
+
+  const currentWorkDurationSeconds = maximizedVideo
+    ? workDurationByDevice[maximizedVideo.id] ?? getVideoWorkDurationSeconds(maximizedVideo)
+    : undefined;
+
+  useEffect(() => {
+    if (!devices.length) return;
+
+    setWorkDurationByDevice((prev) => {
+      const next = { ...prev };
+      let changed = false;
+
+      for (const device of devices) {
+        const backendSeconds = getVideoWorkDurationSeconds(device);
+        if (typeof backendSeconds === "number") {
+          const localSeconds = next[device.id];
+          if (typeof localSeconds !== "number" || backendSeconds > localSeconds) {
+            next[device.id] = backendSeconds;
+            changed = true;
+          }
+        } else if (typeof next[device.id] !== "number") {
+          next[device.id] = 0;
+          changed = true;
+        }
+      }
+
+      return changed ? next : prev;
+    });
+  }, [devices]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setWorkDurationByDevice((prev) => {
+        if (!devices.length) return prev;
+
+        const next = { ...prev };
+        let changed = false;
+
+        for (const device of devices) {
+          if (typeof next[device.id] !== "number") {
+            next[device.id] = getVideoWorkDurationSeconds(device) ?? 0;
+            changed = true;
+          }
+
+          const isWorking =
+            device.status === "online" ||
+            (!!maximizedVideo && maximizedVideo.id === device.id && !!streamUrl);
+
+          if (isWorking) {
+            next[device.id] += 1;
+            changed = true;
+          }
+        }
+
+        return changed ? next : prev;
+      });
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [devices, maximizedVideo, streamUrl]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(WORK_DURATION_STORAGE_KEY, JSON.stringify(workDurationByDevice));
+    } catch {
+      // ignore localStorage write failures
+    }
+  }, [workDurationByDevice]);
 
   // --- ✅ 新增：切换摄像头时重置 AI 状态 ---
   useEffect(() => {
@@ -344,27 +498,74 @@ export default function VideoCenter() {
     }
   };
 
-  const normalizeAlarmBoxes = (data: any) => {
-    if (!data || typeof data !== "object") return [] as any[];
+  const normalizeSingleAlarmBox = (raw: any, fallback: any): AlarmBox | null => {
+    if (!raw || typeof raw !== "object") return null;
 
-    if (Array.isArray(data.boxes) && data.boxes.length > 0) {
-      return data.boxes;
+    let coordsSource =
+      raw.coords ||
+      raw.bbox ||
+      raw.xyxy ||
+      raw.box ||
+      (raw.rect && [raw.rect.left, raw.rect.top, raw.rect.right, raw.rect.bottom]);
+
+    if (!Array.isArray(coordsSource) || coordsSource.length < 4) {
+      const x1 = Number(raw.x1 ?? raw.left ?? raw.x ?? 0);
+      const y1 = Number(raw.y1 ?? raw.top ?? raw.y ?? 0);
+      const x2 = Number(raw.x2 ?? raw.right ?? (Number(raw.w) ? x1 + Number(raw.w) : 0));
+      const y2 = Number(raw.y2 ?? raw.bottom ?? (Number(raw.h) ? y1 + Number(raw.h) : 0));
+      coordsSource = [x1, y1, x2, y2];
     }
 
-    // 兼容后端可能返回的扁平格式：{"type":"...","msg":"..."}
-    if (data.type || data.msg) {
-      return [
-        {
-          type: data.type || "未知警报",
-          msg: data.msg || "检测到异常",
-          score: typeof data.score === "number" ? data.score : 0,
-          coords: Array.isArray(data.coords) ? data.coords : [0, 0, 0, 0],
-          track_id: data.track_id || 0,
-        },
-      ];
+    const numericCoords = coordsSource.map((v: any) => Number(v)).filter(Number.isFinite);
+    if (numericCoords.length < 4) return null;
+
+    let x1 = numericCoords[0];
+    let y1 = numericCoords[1];
+    let x2 = numericCoords[2];
+    let y2 = numericCoords[3];
+
+    if (x2 < x1) [x1, x2] = [x2, x1];
+    if (y2 < y1) [y1, y2] = [y2, y1];
+
+    return {
+      type: raw.type || fallback?.type || "未知警报",
+      msg: raw.msg || fallback?.msg || "检测到异常",
+      score: Number.isFinite(Number(raw.score)) ? Number(raw.score) : Number(fallback?.score) || 0,
+      coords: [x1, y1, x2, y2],
+      track_id: Number(raw.track_id ?? fallback?.track_id ?? 0),
+    };
+  };
+
+  const normalizeAlarmBoxes = (data: any): AlarmBox[] => {
+    if (!data || typeof data !== "object") return [];
+
+    const candidates = [
+      data.boxes,
+      data.data?.boxes,
+      data.payload?.boxes,
+      data.detail?.boxes,
+      data.result?.boxes,
+      data.event?.boxes,
+    ];
+
+    for (const candidate of candidates) {
+      if (!Array.isArray(candidate) || candidate.length === 0) continue;
+      const normalized = candidate
+        .map((box: any) => normalizeSingleAlarmBox(box, data))
+        .filter((box: AlarmBox | null): box is AlarmBox => Boolean(box));
+      if (normalized.length > 0) return normalized;
     }
 
-    return [] as any[];
+    const flatBox = normalizeSingleAlarmBox(data, data);
+    if (flatBox) return [flatBox];
+
+    return [];
+  };
+
+  const parseAlarmPayload = (raw: any): { boxes: AlarmBox[]; alarmLike: any } => {
+    const alarmLike = (raw?.data && typeof raw.data === "object" ? raw.data : raw) || {};
+    const boxes = normalizeAlarmBoxes(raw);
+    return { boxes, alarmLike };
   };
 
   useEffect(() => {
@@ -390,21 +591,38 @@ export default function VideoCenter() {
         ws.onmessage = (event) => {
           let data: any;
           try {
-            data = JSON.parse(event.data);
+            data = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
           } catch {
             return;
           }
 
-          const boxes = normalizeAlarmBoxes(data);
-          if (!boxes.length) return;
+          const { boxes, alarmLike } = parseAlarmPayload(data);
+          const isAlarm = Boolean(
+            boxes.length ||
+              alarmLike?.alarm ||
+              alarmLike?.is_alarm ||
+              alarmLike?.alert ||
+              alarmLike?.msg ||
+              alarmLike?.type
+          );
+          if (!isAlarm) return;
 
-          drawBoxes(boxes);
+          if (boxes.length) {
+            setAlarmBoxes(boxes);
+
+            if (alarmBoxesClearTimerRef.current) {
+              window.clearTimeout(alarmBoxesClearTimerRef.current);
+            }
+            alarmBoxesClearTimerRef.current = window.setTimeout(() => {
+              setAlarmBoxes([]);
+            }, 4200);
+          }
 
           const firstBox = boxes[0];
           setAlarmAlert({
-            type: firstBox.type || "未知警报",
-            msg: firstBox.msg || "检测到异常",
-            score: firstBox.score || 0,
+            type: firstBox?.type || alarmLike?.type || "未知警报",
+            msg: firstBox?.msg || alarmLike?.msg || "检测到异常",
+            score: Number(firstBox?.score ?? alarmLike?.score ?? 0) || 0,
             timestamp: Date.now(),
           });
 
@@ -447,6 +665,10 @@ export default function VideoCenter() {
       if (alarmCloseTimerRef.current) {
         window.clearTimeout(alarmCloseTimerRef.current);
         alarmCloseTimerRef.current = null;
+      }
+      if (alarmBoxesClearTimerRef.current) {
+        window.clearTimeout(alarmBoxesClearTimerRef.current);
+        alarmBoxesClearTimerRef.current = null;
       }
 
       if (alarmWsRef.current) {
@@ -683,17 +905,8 @@ export default function VideoCenter() {
 
   const cols = Math.ceil(Math.sqrt(itemsPerPage));
 
-  if (loading)
-    return (
-      <div className="h-full flex items-center justify-center text-blue-500">
-        <Loader className="animate-spin" size={48} />
-      </div>
-    );
-
-    const trackHistory:any = {}
-
-    const drawBoxes = (boxes: any[]) => {
-      const canvas = document.getElementById("aiCanvas") as HTMLCanvasElement | null;
+    const drawBoxes = useCallback((boxes: AlarmBox[]) => {
+      const canvas = aiCanvasRef.current;
       if (!canvas) return;
 
       const ctx = canvas.getContext("2d");
@@ -708,6 +921,12 @@ export default function VideoCenter() {
 
       const rawVideoW = videoEl?.videoWidth || 0;
       const rawVideoH = videoEl?.videoHeight || 0;
+
+      // 视频元数据未就绪时，依据告警坐标范围做自适应缩放，避免框被画到可视区外
+      const maxCoordX = boxes.reduce((m, b) => Math.max(m, b.coords[0], b.coords[2]), 0);
+      const maxCoordY = boxes.reduce((m, b) => Math.max(m, b.coords[1], b.coords[3]), 0);
+      const inferredSourceW = Math.max(canvas.width, maxCoordX + 1);
+      const inferredSourceH = Math.max(canvas.height, maxCoordY + 1);
 
       let renderX = 0;
       let renderY = 0;
@@ -744,8 +963,8 @@ export default function VideoCenter() {
           y2 *= rawVideoH || 1;
         }
 
-        const sourceW = rawVideoW || canvas.width;
-        const sourceH = rawVideoH || canvas.height;
+        const sourceW = rawVideoW || inferredSourceW;
+        const sourceH = rawVideoH || inferredSourceH;
         const scaleX = renderW / sourceW;
         const scaleY = renderH / sourceH;
 
@@ -774,7 +993,45 @@ export default function VideoCenter() {
         ctx.fillStyle = "white";
         ctx.fillText(label, tagX + 6, tagY + 15);
       });
+    }, []);
+
+  useEffect(() => {
+    if (!maximizedVideo || !streamUrl || !alarmBoxes.length) {
+      const canvas = aiCanvasRef.current;
+      const ctx = canvas?.getContext("2d");
+      if (canvas && ctx) {
+        canvas.width = canvas.offsetWidth;
+        canvas.height = canvas.offsetHeight;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      return;
     }
+
+    const redraw = () => drawBoxes(alarmBoxes);
+    redraw();
+
+    // 初始几秒重复重绘，覆盖视频元数据异步加载导致的坐标偏移
+    const warmupTimer = window.setInterval(redraw, 400);
+    const stopWarmupTimer = window.setTimeout(() => {
+      window.clearInterval(warmupTimer);
+    }, 3000);
+
+    const resizeHandler = () => redraw();
+    window.addEventListener("resize", resizeHandler);
+
+    return () => {
+      window.removeEventListener("resize", resizeHandler);
+      window.clearInterval(warmupTimer);
+      window.clearTimeout(stopWarmupTimer);
+    };
+  }, [alarmBoxes, drawBoxes, maximizedVideo, streamUrl]);
+
+  if (loading)
+    return (
+      <div className="h-full flex items-center justify-center text-blue-500">
+        <Loader className="animate-spin" size={48} />
+      </div>
+    );
 
   return (
     <div className="h-full flex gap-4 p-4 text-slate-100 bg-[radial-gradient(circle_at_12%_8%,rgba(56,189,248,0.20),transparent_32%),radial-gradient(circle_at_86%_2%,rgba(59,130,246,0.22),transparent_30%),linear-gradient(135deg,#020617,#0b1f3f_45%,#102a5e)]">
@@ -1313,8 +1570,14 @@ export default function VideoCenter() {
                       <VideoPlayer src={streamUrl} />
                       <canvas
                       id="aiCanvas"
+                      ref={aiCanvasRef}
                       className="absolute top-0 left-0 w-full h-full pointer-events-none"
                     />
+                      <div className="absolute top-14 left-16 z-20 pointer-events-none flex flex-col gap-0.5 max-w-[45vw] text-black text-lg font-bold leading-7 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)]">
+                        <div className="truncate">{maximizedVideo.name || ""}</div>
+                        <div className="truncate">{maximizedVideo.remark?.trim() || ""}</div>
+                        <div className="truncate">累计工作时长：{formatWorkDuration(currentWorkDurationSeconds)}</div>
+                      </div>
                     </div>
                   </div>
                 </>
@@ -1400,8 +1663,8 @@ export default function VideoCenter() {
                 <div className="bg-slate-900/75 rounded-lg border border-blue-300/25 overflow-y-auto shadow-lg flex-1 vc-scrollbar">
                   <PTZControlPanel
                     video={maximizedVideo}
-                    onSuccess={(msg) => console.log(msg)}
-                    onError={(err) => console.error(err)}
+                    onSuccess={handlePtzSuccess}
+                    onError={handlePtzError}
                   />
                 </div>
 

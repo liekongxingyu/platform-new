@@ -4,7 +4,18 @@ from sqlalchemy.orm import Session
 from typing import List
 from app.core.database import get_db
 # 统一使用 video_schema 以匹配模块结构
-from app.schemas.video_schema import VideoCreate, VideoOut, VideoUpdate, CameraCreateRequest, PTZControlRequest
+from app.schemas.video_schema import (
+    VideoCreate,
+    VideoOut,
+    VideoUpdate,
+    CameraCreateRequest,
+    PTZControlRequest,
+    PresetCreateRequest,
+    PresetGotoRequest,
+    PTZPresetItem,
+    CruiseStartRequest,
+)
+from app.models.video import VideoDevice
 from app.services.video_service import VideoService
 import cv2
 import time
@@ -23,6 +34,11 @@ class AIMonitorRequest(BaseModel):
     device_id: str
     rtsp_url: str
     algo_type: str = "helmet"
+
+
+class PlaybackSaveRequest(BaseModel):
+    start_time: str
+    end_time: str
 
 @router.post("/ai/start")
 async def start_ai(req: AIMonitorRequest):
@@ -139,6 +155,26 @@ def get_video_stream(video_id: int, db: Session = Depends(get_db)):
     return {"url": url}
 
 
+@router.post("/{video_id}/playback/save")
+def save_playback_clip(video_id: int, body: PlaybackSaveRequest):
+    """保存指定时间段的回放视频"""
+    try:
+        return service.save_playback_clip(video_id, body.start_time, body.end_time, output_type="playback", filename_prefix="playback")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"回放保存失败: {e}")
+
+
+@router.post("/time/sync/{video_id}")
+def sync_camera_time(video_id: int, force: bool = True, db: Session = Depends(get_db)):
+    """手动触发摄像头时间同步（默认强制同步）"""
+    result = service.sync_camera_time_if_needed(db, video_id, force=force)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("message", "摄像头校时失败"))
+    return result
+
+
 def _mjpeg_frame_generator(rtsp_url: str):
     cap = cv2.VideoCapture(rtsp_url)
     if not cap.isOpened():
@@ -223,7 +259,79 @@ def ptz_stop(video_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PTZ 停止失败: {e}")
 
-# --- 文件末尾保留 stop 接口即可 ---
+
+@router.get("/ptz/{video_id}/presets", response_model=list[PTZPresetItem])
+def get_presets(video_id: int, db: Session = Depends(get_db)):
+    """获取摄像头预置点列表"""
+    try:
+        return service.list_presets(db, video_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取预置点失败: {e}")
+
+
+@router.post("/ptz/{video_id}/presets", response_model=PTZPresetItem)
+def create_preset(video_id: int, body: PresetCreateRequest, db: Session = Depends(get_db)):
+    """保存当前云台位置为预置点"""
+    try:
+        return service.set_preset(db, video_id, body.name, body.token)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"创建预置点失败: {e}")
+
+
+@router.post("/ptz/{video_id}/presets/{preset_token}/goto")
+def goto_preset(video_id: int, preset_token: str, body: PresetGotoRequest, db: Session = Depends(get_db)):
+    """跳转到指定预置点"""
+    try:
+        return service.goto_preset(db, video_id, preset_token, body.speed or 0.5)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"预置点跳转失败: {e}")
+
+
+@router.delete("/ptz/{video_id}/presets/{preset_token}")
+def delete_preset(video_id: int, preset_token: str, db: Session = Depends(get_db)):
+    """删除预置点"""
+    try:
+        return service.remove_preset(db, video_id, preset_token)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除预置点失败: {e}")
+
+
+@router.post("/ptz/{video_id}/cruise/start")
+def start_cruise(video_id: int, body: CruiseStartRequest, db: Session = Depends(get_db)):
+    """启动常规巡航（按预置点列表轮巡）"""
+    try:
+        return service.start_cruise(db, video_id, body.preset_tokens, body.dwell_seconds or 8.0, body.rounds)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"启动巡航失败: {e}")
+
+
+@router.post("/ptz/{video_id}/cruise/stop")
+def stop_cruise(video_id: int):
+    """停止常规巡航"""
+    try:
+        return service.stop_cruise(video_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"停止巡航失败: {e}")
+
+
+@router.get("/ptz/{video_id}/cruise/status")
+def cruise_status(video_id: int):
+    """获取巡航状态"""
+    try:
+        return service.get_cruise_status(video_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取巡航状态失败: {e}")
+
 
 @router.post("/ai/stop")
 async def stop_ai(device_id: str):

@@ -3,7 +3,8 @@ import time
 import cv2
 import os
 import uuid
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from app.services.ai_service import AIService
 from app.models.alarm_records import AlarmRecord
 from app.core.database import SessionLocal
@@ -34,6 +35,45 @@ class AIManager:
     # =========================
     # 启动监控
     # =========================
+    def _normalize_rtsp_path(self, url: str) -> str:
+        if not isinstance(url, str):
+            return ""
+        raw = url.strip()
+        if not raw.startswith("rtsp://"):
+            return raw
+
+        scheme, _, rest = raw.partition("://")
+        if "/" not in rest:
+            return raw
+
+        host_part, path_part = rest.split("/", 1)
+        return f"{scheme}://{host_part}/" + path_part.lstrip("/")
+
+    def _replace_hik_channel(self, url: str, channel: str) -> str:
+        return re.sub(r"/Streaming/Channels/\d+", f"/Streaming/Channels/{channel}", url)
+
+    def _with_double_slash_path(self, url: str) -> str:
+        if not isinstance(url, str) or not url.startswith("rtsp://"):
+            return url
+        scheme, _, rest = url.partition("://")
+        if "/" not in rest:
+            return url
+        host_part, path_part = rest.split("/", 1)
+        return f"{scheme}://{host_part}//{path_part.lstrip('/')}"
+
+    def _plan_ai_and_record_rtsp(self, rtsp_url: str):
+        """优先将 AI 与录像拆到不同通道，减少部分设备二次 SETUP=500 问题。"""
+        normalized = self._normalize_rtsp_path(str(rtsp_url or ""))
+        if not normalized:
+            return "", ""
+
+        if "/Streaming/Channels/" in normalized:
+            ai_url = self._replace_hik_channel(normalized, "101")
+            rec_url = self._replace_hik_channel(normalized, "102")
+            return ai_url, rec_url
+
+        return normalized, normalized
+
     def start_monitoring(self, device_id, rtsp_url, algo_type="helmet"):
         device_id = str(device_id)
 
@@ -41,21 +81,19 @@ class AIManager:
             print(f"⚠️ 设备 {device_id} 已经在监控中")
             return False
 
-        print(f"--- 启动 AI 监控: {device_id} | 功能: {algo_type} ---")
+        ai_rtsp_url, record_rtsp_url = self._plan_ai_and_record_rtsp(rtsp_url)
+        if not ai_rtsp_url:
+            print("❌ AI 启动失败：RTSP 地址为空")
+            return False
 
-        # 启动 AI 监控时，确保对应摄像头分段录像已经开始，
-        # 避免后续“回放保存/报警前后视频”找不到可用录像分段。
-        try:
-            video_id = int(device_id)
-            if rtsp_url:
-                self.video_service.start_ffmpeg_recording(video_id, rtsp_url)
-        except Exception as e:
-            print(f"⚠️ 启动分段录像失败(不影响AI检测): {e}")
+        print(f"--- 启动 AI 监控: {device_id} | 功能: {algo_type} ---")
+        print(f"🎯 AI拉流地址: {ai_rtsp_url}")
+        print(f"💾 录像拉流地址: {record_rtsp_url}")
 
         stop_event = threading.Event()
         thread = threading.Thread(
             target=self._monitor_loop,
-            args=(device_id, rtsp_url, algo_type, stop_event),
+            args=(device_id, ai_rtsp_url, record_rtsp_url, algo_type, stop_event),
             daemon=True,
         )
 
@@ -89,7 +127,7 @@ class AIManager:
         if rtsp_url == 0 or rtsp_url == "0":
             return [0]
 
-        raw = str(rtsp_url or "").strip()
+        raw = self._normalize_rtsp_path(str(rtsp_url or ""))
         if not raw:
             return []
 
@@ -99,7 +137,20 @@ class AIManager:
             if url and url not in candidates:
                 candidates.append(url)
 
+        # 候选优先级：101 -> 102 -> 1 -> 当前地址，兼容不同海康通道写法。
+        if "/Streaming/Channels/" in raw:
+            channel_match = re.search(r"/Streaming/Channels/(\d+)", raw)
+            current_channel = channel_match.group(1) if channel_match else ""
+
+            for channel in ["101", "102", "1", current_channel]:
+                if not channel:
+                    continue
+                v = self._replace_hik_channel(raw, channel)
+                _push(v)
+                _push(self._with_double_slash_path(v))
+
         _push(raw)
+        _push(self._with_double_slash_path(raw))
 
         # 仅修正路径的重复斜杠，保留原始鉴权串
         if raw.startswith("rtsp://"):
@@ -125,41 +176,47 @@ class AIManager:
                         p_dec = unquote(password or "")
 
                         netloc_encoded = f"{quote(u_dec, safe='')}:{quote(p_dec, safe='')}@{host}{port}"
-                        _push(urlunsplit((parts.scheme or "rtsp", netloc_encoded, path, parts.query, parts.fragment)))
-
-                        # 某些设备对原始字符更宽松，增加一条未编码候选
-                        netloc_raw = f"{u_dec}:{p_dec}@{host}{port}"
-                        _push(urlunsplit((parts.scheme or "rtsp", netloc_raw, path, parts.query, parts.fragment)))
+                        encoded_url = urlunsplit((parts.scheme or "rtsp", netloc_encoded, path, parts.query, parts.fragment))
+                        _push(encoded_url)
+                        _push(self._with_double_slash_path(encoded_url))
                     else:
-                        _push(urlunsplit((parts.scheme or "rtsp", f"{host}{port}", path, parts.query, parts.fragment)))
+                        no_auth_url = urlunsplit((parts.scheme or "rtsp", f"{host}{port}", path, parts.query, parts.fragment))
+                        _push(no_auth_url)
+                        _push(self._with_double_slash_path(no_auth_url))
             except Exception:
                 pass
 
         return candidates
 
     def _open_video_capture(self, rtsp_url):
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000")
         candidates = self._build_rtsp_candidates(rtsp_url)
         if not candidates:
             return None, None
 
-        for candidate in candidates:
-            # 优先 FFmpeg 后端，避免落到 CAP_IMAGES 导致误判
-            for backend in (cv2.CAP_FFMPEG, cv2.CAP_ANY):
-                try:
-                    if candidate == 0:
-                        cap = cv2.VideoCapture(0)
-                    else:
-                        cap = cv2.VideoCapture(candidate, backend)
+        print(f"🔎 RTSP候选地址数: {len(candidates)}")
 
-                    if cap.isOpened():
-                        return cap, candidate
-                    cap.release()
-                except Exception:
-                    continue
+        for candidate in candidates:
+            # 仅使用 FFmpeg 后端，避免 CAP_ANY 落到 CAP_IMAGES 触发误导性异常日志。
+            try:
+                print(f"🔁 尝试拉流: {candidate}")
+                if candidate == 0:
+                    cap = cv2.VideoCapture(0)
+                else:
+                    cap = cv2.VideoCapture(candidate, cv2.CAP_FFMPEG)
+
+                if cap.isOpened():
+                    print(f"✅ 拉流候选可用: {candidate}")
+                    return cap, candidate
+
+                cap.release()
+            except Exception as e:
+                print(f"⚠️ VideoCapture 打开失败: {candidate} | {e}")
+                continue
 
         return None, None
 
-    def _monitor_loop(self, device_id, rtsp_url, algo_type_str, stop_event):
+    def _monitor_loop(self, device_id, rtsp_url, record_rtsp_url, algo_type_str, stop_event):
         print(f"📷 正在连接视频流: {rtsp_url}")
 
         # ========= DEBUG 模式 =========
@@ -191,6 +248,14 @@ class AIManager:
                 return
             print(f"✅ 视频流连接成功: {used_url}")
 
+            # AI 拉流成功后再启动录像，避免部分设备因并发连接导致 AI 打不开。
+            try:
+                video_id = int(device_id)
+                if record_rtsp_url:
+                    self.video_service.start_ffmpeg_recording(video_id, record_rtsp_url)
+            except Exception as e:
+                print(f"⚠️ 启动分段录像失败(不影响AI检测): {e}")
+
         except Exception as e:
             print(f"❌ 视频流异常: {e}")
             return
@@ -221,14 +286,7 @@ class AIManager:
 
                     if is_alarm:
                         img_path = self._save_alarm_image(frame, device_id, details)
-                        alarm_id = self._save_alarm_to_db(device_id, details, img_path)
-
-                        if alarm_id:
-                            threading.Thread(
-                                target=self.video_service.build_alarm_clip_delayed,
-                                args=(alarm_id, 30, 30),
-                                daemon=True,
-                            ).start()
+                        self._save_alarm_to_db(device_id, details, img_path)
 
             except Exception as logic_error:
                 print(f"⚠️ 逻辑异常: {logic_error}")
@@ -252,6 +310,60 @@ class AIManager:
         except Exception as e:
             print(f"❌ 图片保存失败: {e}")
             return ""
+
+    def _save_alarm_clip_async(self, alarm_id: int, device_id: str, alarm_time: datetime):
+        def _worker():
+            try:
+                video_id = int(device_id)
+            except Exception:
+                self._update_alarm_recording_status(alarm_id, "failed", None, "device_id 非摄像头ID，无法自动录像")
+                return
+
+            wait_seconds = (alarm_time + timedelta(minutes=2, seconds=3) - datetime.now()).total_seconds()
+            if wait_seconds > 0:
+                time.sleep(min(wait_seconds, 180))
+
+            clip_start = alarm_time - timedelta(minutes=2)
+            clip_end = alarm_time + timedelta(minutes=2)
+
+            try:
+                result = self.video_service.save_playback_clip(
+                    video_id,
+                    clip_start,
+                    clip_end,
+                    output_type="alarm",
+                    filename_prefix=f"alarm_{alarm_id}",
+                )
+                self._update_alarm_recording_status(
+                    alarm_id,
+                    "saved",
+                    result.get("recording_path"),
+                    None,
+                )
+                print(f"✅ 报警视频已保存 (alarm_id={alarm_id}): {result.get('recording_path')}")
+            except Exception as e:
+                self._update_alarm_recording_status(alarm_id, "failed", None, str(e))
+                print(f"❌ 报警视频保存失败 (alarm_id={alarm_id}): {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _update_alarm_recording_status(self, alarm_id: int, status: str, path: str | None, error: str | None):
+        db = SessionLocal()
+        try:
+            record = db.query(AlarmRecord).filter(AlarmRecord.id == alarm_id).first()
+            if not record:
+                return
+            record.recording_status = status
+            if path:
+                record.recording_path = path
+            if error:
+                record.recording_error = error[:255]
+            db.commit()
+        except Exception as e:
+            print(f"⚠️ 更新报警录像状态失败 alarm_id={alarm_id}: {e}")
+            db.rollback()
+        finally:
+            db.close()
 
     # =========================
     # 写数据库
@@ -292,6 +404,8 @@ class AIManager:
             db.add(record)
             db.commit()
             db.refresh(record)
+
+            self._save_alarm_clip_async(record.id, str(device_id), record.timestamp or datetime.now())
 
             print(f"✅ 报警已保存 (ID: {record.id})")
             return record.id

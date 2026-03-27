@@ -11,6 +11,7 @@ export interface Video {
   username?: string; // 补全：用于编辑回显
   password?: string; // 补全：用于编辑回显
   stream_url?: string; // 后端可能返回 null
+  rtsp_url?: string;
   status: 'online' | 'offline';
   is_active: number;
   remark?: string;
@@ -26,6 +27,7 @@ export interface VideoCreate {
   username?: string;
   password?: string;
   stream_url?: string; // 改为可选，允许为空
+  rtsp_url?: string;
   status?: 'online' | 'offline';
   remark?: string;
 }
@@ -38,6 +40,7 @@ export interface VideoUpdate {
   username?: string;
   password?: string;
   stream_url?: string;
+  rtsp_url?: string;
   status?: 'online' | 'offline';
   remark?: string;
   is_active?: number;
@@ -50,6 +53,34 @@ export interface StreamUrl {
 export interface AIRule {
   key: string;
   desc: string;
+}
+
+export interface PlaybackSavePayload {
+  start_time: string;
+  end_time: string;
+}
+
+export interface PlaybackSaveResponse {
+  status: string;
+  video_id: number;
+  start_time: string;
+  end_time: string;
+  duration_seconds: number;
+  recording_path: string;
+}
+
+export type PTZDirection = 'up' | 'down' | 'left' | 'right' | 'zoom_in' | 'zoom_out';
+
+export interface PTZPresetItem {
+  token: string;
+  name: string;
+}
+
+export interface CruiseStatus {
+  running: boolean;
+  preset_tokens?: string[];
+  dwell_seconds?: number;
+  rounds?: number | null;
 }
 
 // --- API 方法 ---
@@ -92,7 +123,7 @@ export async function updateVideo(id: number, videoData: VideoUpdate): Promise<V
 /** 控制摄像头云台方向 */
 export async function ptzControl(
   videoId: number,
-  direction: 'up' | 'down' | 'left' | 'right',
+  direction: PTZDirection,
   speed: number = 0.5,
   duration: number = 0.5
 ): Promise<{ status: string }> {
@@ -172,7 +203,7 @@ export async function addCameraViaRTSP(cameraData: {
 /** 持续云台移动-开始（按下时调用） */
 export async function ptzStartControl(
   videoId: number,
-  direction: 'up' | 'down' | 'left' | 'right',
+  direction: PTZDirection,
   speed: number = 0.5,
 ): Promise<{ status: string }> {
   const response = await fetch(`${API_BASE_URL}/video/ptz/${videoId}/start`, {
@@ -204,6 +235,140 @@ export async function ptzStopControl(videoId: number): Promise<{ status: string 
     } catch {}
     throw new Error(msg);
   }
+  return response.json();
+}
+
+export async function getPresets(videoId: number): Promise<PTZPresetItem[]> {
+  const response = await fetch(`${API_BASE_URL}/video/ptz/${videoId}/presets`);
+  if (!response.ok) {
+    let msg = 'Failed to fetch presets';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+export async function createPreset(videoId: number, payload: { name?: string; token?: string }): Promise<PTZPresetItem> {
+  const response = await fetch(`${API_BASE_URL}/video/ptz/${videoId}/presets`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    let msg = 'Failed to create preset';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+export async function gotoPreset(videoId: number, presetToken: string, speed: number = 0.5): Promise<{ status: string }> {
+  const response = await fetch(`${API_BASE_URL}/video/ptz/${videoId}/presets/${encodeURIComponent(presetToken)}/goto`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ speed }),
+  });
+  if (!response.ok) {
+    let msg = 'Failed to goto preset';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+export async function deletePreset(videoId: number, presetToken: string): Promise<{ status: string }> {
+  const response = await fetch(`${API_BASE_URL}/video/ptz/${videoId}/presets/${encodeURIComponent(presetToken)}`, {
+    method: 'DELETE',
+  });
+  if (!response.ok) {
+    let msg = 'Failed to delete preset';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+export async function startCruise(videoId: number, payload: {
+  preset_tokens: string[];
+  dwell_seconds?: number;
+  rounds?: number | null;
+}): Promise<{ status: string }> {
+  const response = await fetch(`${API_BASE_URL}/video/ptz/${videoId}/cruise/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    let msg = 'Failed to start cruise';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+export async function stopCruise(videoId: number): Promise<{ status: string }> {
+  const response = await fetch(`${API_BASE_URL}/video/ptz/${videoId}/cruise/stop`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    let msg = 'Failed to stop cruise';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+export async function getCruiseStatus(videoId: number): Promise<CruiseStatus> {
+  const response = await fetch(`${API_BASE_URL}/video/ptz/${videoId}/cruise/status`);
+  if (!response.ok) {
+    let msg = 'Failed to fetch cruise status';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+/** 保存指定设备在自定义时间段的回放视频 */
+export async function savePlaybackClip(
+  videoId: number,
+  payload: PlaybackSavePayload
+): Promise<PlaybackSaveResponse> {
+  const response = await fetch(`${API_BASE_URL}/video/${videoId}/playback/save`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    let msg = 'Failed to save playback clip';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+
   return response.json();
 }
 
