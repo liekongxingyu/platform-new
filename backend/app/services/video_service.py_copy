@@ -1,6 +1,6 @@
 import json
 from sqlalchemy.orm import Session
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from app.models.video import VideoDevice
 from app.models.device import Device
 from app.schemas.video_schema import VideoCreate, VideoUpdate, CameraCreateRequest
@@ -94,6 +94,12 @@ PLAYBACK_ARCHIVE_WINDOW_HOURS = max(1, int(os.getenv("PLAYBACK_ARCHIVE_WINDOW_HO
 PLAYBACK_ARCHIVE_LOOKBACK_HOURS = max(PLAYBACK_ARCHIVE_WINDOW_HOURS, int(os.getenv("PLAYBACK_ARCHIVE_LOOKBACK_HOURS", "24")))
 PERIODIC_ARCHIVE_LAST_RUN_AT: Dict[int, float] = {}
 EZVIZ_PRESET_UNSUPPORTED_DEVICES: Set[int] = set()
+
+# [新增] 全局缓存：存储流媒体地址，避免频繁请求萤石云API导致并发数达到上限
+# 缓存结构：{video_id: {"url": str, "expired_at": float, "play_type": str, ...}}
+STREAM_URL_CACHE: Dict[int, Dict[str, Any]] = {}
+STREAM_URL_CACHE_LOCK = threading.Lock()
+STREAM_CACHE_VALID_SECONDS = int(os.getenv("VIDEO_STREAM_CACHE_SECONDS", "3300"))  # 缓存有效期3300秒（比token 3600秒短一点）
 
 class VideoService:
     def _get_ezviz_config(self) -> tuple[str, str, str]:
@@ -704,25 +710,10 @@ class VideoService:
             resolved_play_type = "flv"
 
         # 云流场景也要持续落本地分段，供临时缓存/常态回放使用。
-        record_entry = RECORDING_PROCESSES.get(db_video.id)
-        record_running = False
-        if isinstance(record_entry, dict):
-            record_proc = record_entry.get("process")
-            if record_proc is not None:
-                try:
-                    record_running = record_proc.poll() is None
-                except Exception:
-                    record_running = False
-        elif record_entry is not None:
-            try:
-                record_running = record_entry.poll() is None
-            except Exception:
-                record_running = False
-
-        if not record_running:
-            record_source = self._get_record_source_for_device(db_video)
-            if record_source:
-                self.start_ffmpeg_recording(db_video.id, record_source)
+        # 每次取流都尝试自愈；start_ffmpeg_recording 内部会按 source_key 判断是否需要重启。
+        record_source = self._get_record_source_for_device(db_video)
+        if record_source:
+            self.start_ffmpeg_recording(db_video.id, record_source)
 
         return {
             "url": url,
@@ -777,13 +768,49 @@ class VideoService:
             return {"status": "degraded", "message": str(e)}
 
     def get_stream_info(self, db: Session, video_id: int):
+        """
+        获取流媒体地址，优先使用缓存避免频繁请求萤石云API。
+        
+        key point: 缓存机制可大幅降低萤石云并发连接数，解决免费版并发数限制问题。
+        """
+        global STREAM_URL_CACHE
+
+        # 1. 检查缓存是否有效
+        now = time.time()
+        if video_id in STREAM_URL_CACHE:
+            cached = STREAM_URL_CACHE[video_id]
+            if cached.get("expired_at", 0) > now:
+                logger.info(f"✅ 命中流地址缓存 video_id={video_id}")
+                return cached["data"]
+            else:
+                # 缓存已过期，清理
+                del STREAM_URL_CACHE[video_id]
+
+        # 2. 缓存未命中，从数据库和云平台获取
         db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
         if not db_video:
             return None
 
-        if self._is_ezviz_access(db_video):
-            return self._get_stream_info_ezviz(db_video)
-        return self._get_stream_info_local(db_video)
+        try:
+            if self._is_ezviz_access(db_video):
+                data = self._get_stream_info_ezviz(db_video)
+            else:
+                data = self._get_stream_info_local(db_video)
+            
+            # 3. 缓存结果
+            if data and data.get("url"):
+                with STREAM_URL_CACHE_LOCK:
+                    STREAM_URL_CACHE[video_id] = {
+                        "data": data,
+                        "expired_at": now + STREAM_CACHE_VALID_SECONDS,
+                        "cached_at": now,
+                    }
+                logger.info(f"📝 缓存流地址 video_id={video_id}, 有效期={STREAM_CACHE_VALID_SECONDS}秒")
+            
+            return data
+        except Exception as e:
+            logger.error(f"获取流地址失败 video_id={video_id}: {e}")
+            raise
 
     def _create_ptz_and_media(self, db: Session, video_id: int):
         db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
@@ -1413,17 +1440,39 @@ class VideoService:
 
         return None
 
+    def _normalize_record_source_for_compare(self, source_url: str) -> str:
+        """比较录制源时去掉临时 token 参数，避免云地址每次刷新触发无意义重启。"""
+        raw = str(source_url or "").strip()
+        if not raw:
+            return ""
+
+        lower = raw.lower()
+        if lower.startswith("rtsp://"):
+            return raw
+
+        try:
+            parsed = urlparse(raw)
+            # 对云流地址仅比较 scheme/netloc/path，忽略 query 中的 expire/id/t。
+            if parsed.scheme in {"http", "https", "rtmp", "rtmps"}:
+                return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        except Exception:
+            pass
+
+        return raw
+
     def start_ffmpeg_recording(self, video_id: int, source_url: str):
         if not source_url:
             logger.warning(f"录像启动失败，video_id={video_id} 缺少可录制地址")
             return None
 
         # 如果同一路录像进程正在运行且源地址未变，不要重启。
+        source_key = self._normalize_record_source_for_compare(source_url)
         existing = RECORDING_PROCESSES.get(video_id)
         if isinstance(existing, dict):
             existing_process = existing.get("process")
             existing_source = existing.get("source_url") or existing.get("rtsp_url")
-            if existing_process and existing_process.poll() is None and existing_source == source_url:
+            existing_source_key = existing.get("source_key") or self._normalize_record_source_for_compare(str(existing_source or ""))
+            if existing_process and existing_process.poll() is None and existing_source_key == source_key:
                 return existing_process
         elif existing is not None:
             try:
@@ -1482,6 +1531,7 @@ class VideoService:
                 "process": process,
                 "log_file": log_file,
                 "source_url": source_url,
+                "source_key": source_key,
             }
             return process
         except Exception as e:

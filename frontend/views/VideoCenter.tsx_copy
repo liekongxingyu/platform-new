@@ -29,7 +29,6 @@ import {
   createVideo,
   deleteVideo,
   getVideoStreamUrl,
-  clearVideoStreamUrlCache,
   addCameraViaRTSP,
   updateVideo,
   ptzControl,
@@ -238,7 +237,6 @@ export default function VideoCenter() {
   const [previewStreams, setPreviewStreams] = useState<Record<number, StreamUrl>>({});
   const [previewLoading, setPreviewLoading] = useState<Record<number, boolean>>({});
   const [previewErrors, setPreviewErrors] = useState<Record<number, string>>({});
-  const ezopenRecoveringRef = useRef<string | null>(null);
   const [workDurationByDevice, setWorkDurationByDevice] = useState<Record<number, number>>(loadWorkDurationMap);
 
   // --- 弹窗与表单状态 ---
@@ -746,14 +744,15 @@ export default function VideoCenter() {
   const handleShowStream = async (device: Video) => {
     try {
       // 全屏播放时总是拉取最新地址，避免设备配置切换后复用旧缓存。
-      const info = await getVideoStreamUrl(device.id, {
-        forceRefresh: isEzvizCloudDevice(device),
+      const info = await getVideoStreamUrl(device.id);
+      // 同一设备仅保留一个播放会话：全屏时主动清掉对应预览流。
+      setPreviewStreams((prev) => {
+        const next = { ...prev };
+        delete next[device.id];
+        return next;
       });
-      // 进入全屏时切断全部小屏链路，避免多路会话抢占。
-      setPreviewStreams({});
-      setPreviewLoading({});
-      setPreviewErrors({});
-      ezopenRecoveringRef.current = null;
+      setPreviewLoading((prev) => ({ ...prev, [device.id]: false }));
+      setPreviewErrors((prev) => ({ ...prev, [device.id]: "" }));
       setStreamInfo(info);
       setStreamUrl(info.url);
       setMaximizedVideo(device);
@@ -764,6 +763,9 @@ export default function VideoCenter() {
 
   const loadPreviewStream = useCallback(
     async (device: Video) => {
+      if (isEzvizCloudDevice(device)) {
+        return;
+      }
       if (maximizedVideo?.id === device.id) {
         return;
       }
@@ -784,7 +786,7 @@ export default function VideoCenter() {
         setPreviewLoading((prev) => ({ ...prev, [device.id]: false }));
       }
     },
-    [maximizedVideo?.id, previewLoading, previewStreams]
+    [isEzvizCloudDevice, maximizedVideo?.id, previewLoading, previewStreams]
   );
 
   useEffect(() => {
@@ -1244,6 +1246,17 @@ export default function VideoCenter() {
                           <div className="h-full w-full flex items-center justify-center text-cyan-200 text-xs bg-slate-950/70">
                             当前设备正在全屏播放，已暂停预览拉流
                           </div>
+                        ) : isEzvizCloudDevice(device) ? (
+                          <button
+                            className="h-full w-full flex flex-col items-center justify-center gap-2 text-slate-200 text-sm"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleShowStream(device);
+                            }}
+                          >
+                            <span>萤石云设备默认不自动预览</span>
+                            <span className="text-cyan-300 text-xs">点击开始单路播放</span>
+                          </button>
                         ) : previewStreams[device.id] ? (
                           <VideoPlayer
                             key={previewStreams[device.id].url}
@@ -1738,7 +1751,6 @@ export default function VideoCenter() {
                 setMaximizedVideo(null);
                 setStreamUrl(null);
                 setStreamInfo(null);
-                ezopenRecoveringRef.current = null;
               }}
               className="p-2 text-slate-400 hover:bg-rose-500/20 hover:text-rose-300 rounded-full transition-colors"
             >
@@ -1765,34 +1777,7 @@ export default function VideoCenter() {
                   </div>
                   <div className="flex-1 flex items-center justify-center bg-black relative min-h-0">
                     <div className="relative w-full h-full">
-                      <VideoPlayer
-                        src={streamUrl}
-                        playType={streamInfo?.play_type}
-                        accessToken={streamInfo?.access_token}
-                        onError={async () => {
-                          if (!maximizedVideo) return;
-                          const isEzopenStream =
-                            String(streamInfo?.play_type || "").toLowerCase() === "ezopen" ||
-                            String(streamUrl || "").toLowerCase().startsWith("ezopen://") ||
-                            isEzvizCloudDevice(maximizedVideo);
-                          if (!isEzopenStream) return;
-
-                          const recoverKey = `${maximizedVideo.id}:${streamUrl}`;
-                          if (ezopenRecoveringRef.current === recoverKey) {
-                            return;
-                          }
-                          ezopenRecoveringRef.current = recoverKey;
-
-                          try {
-                            clearVideoStreamUrlCache(maximizedVideo.id);
-                            const fresh = await getVideoStreamUrl(maximizedVideo.id, { forceRefresh: true });
-                            setStreamInfo(fresh);
-                            setStreamUrl(fresh.url);
-                          } catch (refreshErr) {
-                            console.error("EZOPEN 播放失败后刷新流地址仍失败:", refreshErr);
-                          }
-                        }}
-                      />
+                      <VideoPlayer src={streamUrl} playType={streamInfo?.play_type} accessToken={streamInfo?.access_token} />
                       <canvas
                       id="aiCanvas"
                       ref={aiCanvasRef}

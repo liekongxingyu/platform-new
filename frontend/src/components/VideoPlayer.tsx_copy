@@ -11,14 +11,11 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, playType, accessToken, o
   const videoRef = useRef<HTMLVideoElement>(null);
   const ezContainerRef = useRef<HTMLDivElement>(null);
   const ezContainerIdRef = useRef(`ez-player-${Math.random().toString(36).slice(2)}`);
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const playerRef = useRef<any>(null);
   const ezPlayerRef = useRef<any>(null);
-  const lastInitKeyRef = useRef<string>('');
   const retryCountRef = useRef(0);
   const retryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error'>('connecting');
-  const [ezFallbackMode, setEzFallbackMode] = useState<'sdk' | 'iframe' | null>(null);
 
   const maxRetries = 10; // 增加到10次
   const retryDelay = 1000; // 减少到1秒，让重试更频繁
@@ -48,23 +45,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, playType, accessToken, o
         ezPlayerRef.current = null;
       }
     }
-
-    if (iframeRef.current) {
-      try {
-        iframeRef.current.src = 'about:blank';
-      } catch (e) {
-        console.warn('Error clearing iframe:', e);
-      }
-    }
-
-    setEzFallbackMode(null);
-  };
-
-  const buildEzvizIframeUrl = (url: string, token?: string) => {
-    const encodedUrl = encodeURIComponent(url);
-    const encodedToken = encodeURIComponent(token || '');
-
-    return `https://open.ys7.com/ezopen/h5/iframe_se?url=${encodedUrl}&accessToken=${encodedToken}&autoplay=1`;
   };
 
   const initPlayer = () => {
@@ -73,15 +53,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, playType, accessToken, o
       const isEzopen = effectivePlayType === 'ezopen' || (src || '').toLowerCase().startsWith('ezopen://');
 
       if (isEzopen) {
-        const initKey = `${src}__${accessToken || ''}__${playType || ''}`;
-
-        if (lastInitKeyRef.current === initKey && (ezPlayerRef.current || ezFallbackMode)) {
-          console.log('Skip duplicate ezopen init:', initKey);
-          return;
-        }
-
-        lastInitKeyRef.current = initKey;
-
         const EZUIKit = (window as any).EZUIKit;
         if (EZUIKit && ezContainerRef.current) {
           try {
@@ -89,9 +60,6 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, playType, accessToken, o
             if (!PlayerCtor) {
               throw new Error('SDK 已加载但未找到可用播放器构造器');
             }
-
-            setEzFallbackMode('sdk');
-
             ezPlayerRef.current = new PlayerCtor({
               id: ezContainerIdRef.current,
               url: src,
@@ -100,25 +68,17 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, playType, accessToken, o
               width: '100%',
               height: '100%'
             });
-
             setConnectionStatus('connected');
             return;
           } catch (e: any) {
-            console.warn('EZUIKit init failed, fallback to iframe:', e);
+            setConnectionStatus('error');
+            onError?.(`萤石播放器初始化失败: ${e?.message || e}`);
+            return;
           }
-        } else {
-          console.warn('EZUIKit SDK not found, fallback to iframe');
         }
-
-        try {
-          setEzFallbackMode('iframe');
-          setConnectionStatus('connected');
-          return;
-        } catch (e: any) {
-          setConnectionStatus('error');
-          onError?.(`萤石播放器初始化失败: ${e?.message || e}`);
-          return;
-        }
+        setConnectionStatus('error');
+        onError?.('当前页面未加载萤石播放器 SDK，无法播放萤石云视频');
+        return;
       }
 
       if (!videoRef.current) return;
@@ -259,63 +219,42 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, playType, accessToken, o
 
   useEffect(() => {
     if (!src) return;
-
-    const initKey = `${src}__${accessToken || ''}__${playType || ''}`;
+    
     console.log('Video source changed:', src);
     retryCountRef.current = 0; // 重置重试计数
     setConnectionStatus('connecting');
     initPlayer();
 
     return () => {
-      if (lastInitKeyRef.current === initKey) {
-        console.log('Cleaning up video player');
-        cleanupPlayer();
-        lastInitKeyRef.current = '';
-      }
+      console.log('Cleaning up video player');
+      cleanupPlayer();
     };
   }, [src, playType, accessToken]);
 
   return (
     <div className="w-full h-full bg-black rounded-lg overflow-hidden relative">
       {(playType || '').toLowerCase() === 'ezopen' || (src || '').toLowerCase().startsWith('ezopen://') ? (
-        <div className="w-full h-full relative bg-black rounded overflow-hidden">
-          <div
-            id={ezContainerIdRef.current}
-            ref={ezContainerRef}
-            className={`w-full h-full ${ezFallbackMode === 'iframe' ? 'hidden' : 'block'}`}
-          />
-
-          {ezFallbackMode === 'iframe' && (
-            <iframe
-              ref={iframeRef}
-              title="ezviz-player-fallback"
-              src={buildEzvizIframeUrl(src, accessToken)}
-              className="w-full h-full border-0"
-              allow="autoplay; fullscreen"
-            />
-          )}
-
+        <div className="w-full h-full flex flex-col items-center justify-center text-white gap-3 p-4">
+          <div id={ezContainerIdRef.current} ref={ezContainerRef} className="w-full h-full" />
           {connectionStatus === 'error' && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center text-white bg-black/70 z-10">
-              <div className="text-2xl font-bold mb-2">EZOPEN 播放器不可用</div>
-              <div className="text-sm opacity-80 break-all px-6 text-center">{src}</div>
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 p-4 text-center">
+              <div className="text-lg font-semibold">EZOPEN 播放器不可用</div>
+              <div className="text-sm text-gray-300 mt-2 break-all">{src}</div>
             </div>
           )}
-
           {connectionStatus === 'connecting' && (
-            <div className="absolute inset-0 flex items-center justify-center text-white bg-black/40 z-10">
-              正在加载萤石播放器...
+            <div className="absolute inset-0 flex items-center justify-center bg-black/55 p-4 text-center">
+              <div className="text-sm text-gray-200">正在加载萤石播放器...</div>
             </div>
           )}
         </div>
       ) : (
       <video
         ref={videoRef}
-        className="w-full h-full object-contain bg-black rounded"
+        className="w-full h-full object-contain"
         controls
         autoPlay
         muted // 添加 muted 避免浏览器自动播放策略限制
-        playsInline
       />
       )}
       
