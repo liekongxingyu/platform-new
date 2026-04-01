@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   ChevronUp,
   ChevronDown,
@@ -17,6 +17,8 @@ import {
 import {
   ptzStartControl,
   ptzStopControl,
+  zoomStartControl,
+  zoomStopControl,
   Video,
   PTZDirection,
   PTZPresetItem,
@@ -42,13 +44,23 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
   onSuccess
 }) => {
   const [isControlling, setIsControlling] = useState(false);
-  const [speed, setSpeed] = useState(0.3);
+  // 临时停用“变速控制”功能：保留原代码，后续需要时可恢复。
+  // const [speed, setSpeed] = useState(0.3);
+  const fixedControlSpeed = 0.5;
   const [presets, setPresets] = useState<PTZPresetItem[]>([]);
   const [newPresetName, setNewPresetName] = useState('');
   const [selectedPresetTokens, setSelectedPresetTokens] = useState<string[]>([]);
   const [dwellSeconds, setDwellSeconds] = useState(8);
   const [isCruising, setIsCruising] = useState(false);
   const [busy, setBusy] = useState(false);
+  const activeControlTypeRef = useRef<'ptz' | 'zoom' | null>(null);
+  const stopInFlightRef = useRef(false);
+  const lastStopAtRef = useRef(0);
+
+  const canPTZ = (video.supports_ptz ?? 1) === 1;
+  const canPreset = (video.supports_preset ?? 1) === 1;
+  const canCruise = (video.supports_cruise ?? 1) === 1;
+  const canZoom = (video.supports_zoom ?? 1) === 1;
 
   const getDirectionName = (direction: string): string => {
     const names: Record<string, string> = {
@@ -87,25 +99,64 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
 
   const startMove = useCallback(
     async (direction: PTZDirection) => {
+      if (!canPTZ) {
+        onError?.('当前设备不支持云台控制');
+        return;
+      }
+      if ((direction === 'zoom_in' || direction === 'zoom_out') && !canZoom) {
+        onError?.('当前设备不支持变焦控制');
+        return;
+      }
       if (isControlling) return;
       try {
         setIsControlling(true);
-        await ptzStartControl(video.id, direction, speed);
+        const isZoomDirection = direction === 'zoom_in' || direction === 'zoom_out';
+        if (isZoomDirection) {
+          await zoomStartControl(video.id, direction, fixedControlSpeed);
+          activeControlTypeRef.current = 'zoom';
+        } else {
+          await ptzStartControl(video.id, direction, fixedControlSpeed);
+          activeControlTypeRef.current = 'ptz';
+        }
         onSuccess?.(`摄像头向${getDirectionName(direction)}移动中...`);
       } catch (err: any) {
+        activeControlTypeRef.current = null;
         onError?.(`云台控制失败: ${err.message || err}`);
         setIsControlling(false);
       }
     },
-    [isControlling, speed, video.id, onSuccess, onError]
+    [canPTZ, canZoom, isControlling, fixedControlSpeed, video.id, onSuccess, onError]
   );
 
   const stopMove = useCallback(async () => {
+    const now = Date.now();
+    if (now - lastStopAtRef.current < 180) {
+      return;
+    }
+    lastStopAtRef.current = now;
+
+    if (stopInFlightRef.current) {
+      return;
+    }
+
+    const activeControlType = activeControlTypeRef.current;
+    if (!activeControlType) {
+      setIsControlling(false);
+      return;
+    }
+
+    stopInFlightRef.current = true;
     try {
-      await ptzStopControl(video.id);
+      if (activeControlType === 'zoom') {
+        await zoomStopControl(video.id);
+      } else {
+        await ptzStopControl(video.id);
+      }
     } catch (err: any) {
       onError?.(`云台停止失败: ${err.message || err}`);
     } finally {
+      activeControlTypeRef.current = null;
+      stopInFlightRef.current = false;
       setIsControlling(false);
     }
   }, [video.id, onError]);
@@ -116,6 +167,7 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
     onMouseLeave: stopMove,
     onTouchStart: () => startMove(direction),
     onTouchEnd: stopMove,
+    onTouchCancel: stopMove,
   });
 
   const handleCreatePreset = async () => {
@@ -139,7 +191,7 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
   const handleGotoPreset = async (token: string) => {
     try {
       setBusy(true);
-      await gotoPreset(video.id, token, speed);
+      await gotoPreset(video.id, token, fixedControlSpeed);
       onSuccess?.('已跳转到预置点');
     } catch (err: any) {
       onError?.(`预置点跳转失败: ${err.message || err}`);
@@ -255,8 +307,8 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
         {/* 上 */}
         <button
           {...bindPress('up')}
-          disabled={false}
-          className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white transition"
+          disabled={!canPTZ}
+          className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white transition disabled:opacity-40"
           title="向上"
         >
           <ChevronUp size={24} />
@@ -266,7 +318,8 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
         <div className="flex gap-2">
           <button
             {...bindPress('left')}
-            className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white transition"
+            disabled={!canPTZ}
+            className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white transition disabled:opacity-40"
             title="向左"
           >
             <ChevronLeft size={24} />
@@ -285,7 +338,8 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
 
           <button
             {...bindPress('right')}
-            className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white transition"
+            disabled={!canPTZ}
+            className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white transition disabled:opacity-40"
             title="向右"
           >
             <ChevronRight size={24} />
@@ -295,7 +349,8 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
         {/* 下 */}
         <button
           {...bindPress('down')}
-          className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white transition"
+          disabled={!canPTZ}
+          className="p-2 rounded-lg bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white transition disabled:opacity-40"
           title="向下"
         >
           <ChevronDown size={24} />
@@ -304,14 +359,16 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
         <div className="flex items-center gap-2 mt-2">
           <button
             {...bindPress('zoom_out')}
-            className="p-2 rounded-lg bg-indigo-500 hover:bg-indigo-600 active:bg-indigo-700 text-white transition"
+            disabled={!canPTZ || !canZoom}
+            className="p-2 rounded-lg bg-indigo-500 hover:bg-indigo-600 active:bg-indigo-700 text-white transition disabled:opacity-40"
             title="缩小"
           >
             <ZoomOut size={20} />
           </button>
           <button
             {...bindPress('zoom_in')}
-            className="p-2 rounded-lg bg-indigo-500 hover:bg-indigo-600 active:bg-indigo-700 text-white transition"
+            disabled={!canPTZ || !canZoom}
+            className="p-2 rounded-lg bg-indigo-500 hover:bg-indigo-600 active:bg-indigo-700 text-white transition disabled:opacity-40"
             title="放大"
           >
             <ZoomIn size={20} />
@@ -321,22 +378,25 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
 
       {/* 参数控制 */}
       <div className="border-t pt-4 space-y-3">
-        {/* 速度 */}
-        <div>
-          <label className="block text-sm font-medium text-slate-200 mb-1">
-            速度: {speed.toFixed(1)}
-          </label>
-          <input
-            type="range"
-            min="0.1"
-            max="1.0"
-            step="0.1"
-            value={speed}
-            onChange={(e) => setSpeed(parseFloat(e.target.value))}
-            className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer"
-          />
-          <div className="text-xs text-slate-400 mt-1">范围: 0.1 (慢) - 1.0 (快)</div>
-        </div>
+        {/*
+          临时停用“变速控制”UI：
+          <div>
+            <label className="block text-sm font-medium text-slate-200 mb-1">
+              速度: {speed.toFixed(1)}
+            </label>
+            <input
+              type="range"
+              min="0.1"
+              max="1.0"
+              step="0.1"
+              value={speed}
+              onChange={(e) => setSpeed(parseFloat(e.target.value))}
+              className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer"
+            />
+            <div className="text-xs text-slate-400 mt-1">范围: 0.1 (慢) - 1.0 (快)</div>
+          </div>
+        */}
+        <div className="text-xs text-slate-400">控制速度：固定 0.5</div>
 
         <div className="pt-2 border-t border-blue-300/20 space-y-2">
           <div className="flex items-center justify-between">
@@ -359,7 +419,7 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
             />
             <button
               onClick={handleCreatePreset}
-              disabled={busy}
+              disabled={busy || !canPreset}
               className="px-2 py-1.5 rounded bg-cyan-500 hover:bg-cyan-400 text-slate-900"
               title="保存预置点"
             >
@@ -377,18 +437,21 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
                     type="checkbox"
                     checked={selectedPresetTokens.includes(preset.token)}
                     onChange={() => handleToggleCruisePreset(preset.token)}
+                    disabled={!canPreset}
                   />
                   <button
                     onClick={() => handleGotoPreset(preset.token)}
-                    className="flex-1 text-left text-xs text-slate-200 hover:text-cyan-300 truncate"
+                    className="flex-1 text-left text-xs text-slate-200 hover:text-cyan-300 truncate disabled:opacity-40"
                     title={preset.token}
+                    disabled={!canPreset}
                   >
                     {preset.name || preset.token}
                   </button>
                   <button
                     onClick={() => handleDeletePreset(preset.token)}
-                    className="text-rose-300 hover:text-rose-200"
+                    className="text-rose-300 hover:text-rose-200 disabled:opacity-40"
                     title="删除预置点"
+                    disabled={!canPreset}
                   >
                     <Trash2 size={12} />
                   </button>
@@ -400,7 +463,7 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
           <div className="flex gap-2 pt-1">
             <button
               onClick={() => handleBatchDeletePresets(selectedPresetTokens, false)}
-              disabled={busy || selectedPresetTokens.length === 0}
+              disabled={busy || selectedPresetTokens.length === 0 || !canPreset}
               className="flex-1 px-2 py-1.5 rounded bg-rose-500/90 hover:bg-rose-400 disabled:opacity-50 text-slate-950 text-xs font-semibold"
               title="批量删除已勾选预置点"
             >
@@ -408,7 +471,7 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
             </button>
             <button
               onClick={() => handleBatchDeletePresets(presets.map((p) => p.token), true)}
-              disabled={busy || presets.length === 0}
+              disabled={busy || presets.length === 0 || !canPreset}
               className="flex-1 px-2 py-1.5 rounded bg-rose-700/90 hover:bg-rose-600 disabled:opacity-50 text-slate-100 text-xs font-semibold"
               title="清空全部预置点"
             >
@@ -436,14 +499,14 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
           <div className="flex gap-2">
             <button
               onClick={handleStartCruise}
-              disabled={busy || isCruising}
+              disabled={busy || isCruising || !canCruise}
               className="flex-1 flex items-center justify-center gap-1 py-1.5 rounded bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 text-xs font-semibold"
             >
               <Play size={12} /> 启动巡航
             </button>
             <button
               onClick={handleStopCruise}
-              disabled={busy || !isCruising}
+              disabled={busy || !isCruising || !canCruise}
               className="flex-1 flex items-center justify-center gap-1 py-1.5 rounded bg-rose-500 hover:bg-rose-400 disabled:opacity-50 text-slate-950 text-xs font-semibold"
             >
               <Square size={12} /> 停止巡航
@@ -462,7 +525,10 @@ const PTZControlPanel: React.FC<PTZControlPanelProps> = ({
           <span className="font-medium">摄像头:</span> {video.name}
         </p>
         <p className="text-sm text-slate-300">
-          <span className="font-medium">地址:</span> {video.ip_address}:{video.port}
+          <span className="font-medium">地址:</span> {video.ip_address || '-'}:{video.port || 80}
+        </p>
+        <p className="text-xs text-slate-400 mt-1">
+          平台: {video.platform_type || 'onvif'} | PTZ来源: {video.ptz_source || 'onvif'}
         </p>
       </div>
     </div>

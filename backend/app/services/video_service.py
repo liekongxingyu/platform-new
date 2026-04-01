@@ -1,6 +1,6 @@
 import json
 from sqlalchemy.orm import Session
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from app.models.video import VideoDevice
 from app.models.device import Device
 from app.schemas.video_schema import VideoCreate, VideoUpdate, CameraCreateRequest
@@ -19,7 +19,7 @@ import hashlib
 import base64
 import uuid
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
 
 RECORDING_PROCESSES = {}
 
@@ -60,8 +60,55 @@ CAMERA_TIME_SYNC_CACHE: Dict[int, float] = {}
 # [新增] 全局字典：用于存储正在运行的 FFmpeg 进程 {stream_name: process_object}
 FFMPEG_PROCESSES = {}
 CRUISE_TASKS = {}
+EZVIZ_TOKEN_CACHE: Dict[str, Any] = {"access_token": None, "expire_at": 0.0}
+EZVIZ_TOKEN_LOCK = threading.Lock()
+EZVIZ_PTZ_LAST_DIRECTION: Dict[int, int] = {}
+EZVIZ_PTZ_LAST_STOP_AT: Dict[int, float] = {}
+
+EZVIZ_BASE_URL = os.getenv("EZVIZ_BASE_URL", "https://open.ys7.com").rstrip("/")
+EZVIZ_APP_KEY = os.getenv("EZVIZ_APP_KEY", "")
+EZVIZ_APP_SECRET = os.getenv("EZVIZ_APP_SECRET", "")
+DEFAULT_STREAM_PROTOCOL = os.getenv("VIDEO_DEFAULT_STREAM_PROTOCOL", "ezopen")
+
+STREAM_PROTOCOL_MAP = {
+    "ezopen": 1,
+    "hls": 2,
+    "rtmp": 3,
+    "flv": 4,
+}
+
+EZVIZ_DIRECTION_MAP = {
+    "up": 0,
+    "down": 1,
+    "left": 2,
+    "right": 3,
+    "zoom_in": 8,
+    "zoom_out": 9,
+}
+
+TOKEN_ERROR_CODES = {"10002", "10029", "10030", "10031", "20002"}
+# 近实时回放依赖短分段；常态回放由独立归档逻辑完成，不与分段时长绑定。
+RECORD_SEGMENT_SECONDS = int(os.getenv("VIDEO_RECORD_SEGMENT_SECONDS", "30"))
+RECORD_SEGMENT_SAFE_MARGIN_SECONDS = int(os.getenv("VIDEO_RECORD_SEGMENT_SAFE_MARGIN_SECONDS", "8"))
+PLAYBACK_ARCHIVE_WINDOW_HOURS = max(1, int(os.getenv("PLAYBACK_ARCHIVE_WINDOW_HOURS", "3")))
+PLAYBACK_ARCHIVE_LOOKBACK_HOURS = max(PLAYBACK_ARCHIVE_WINDOW_HOURS, int(os.getenv("PLAYBACK_ARCHIVE_LOOKBACK_HOURS", "24")))
+PERIODIC_ARCHIVE_LAST_RUN_AT: Dict[int, float] = {}
+EZVIZ_PRESET_UNSUPPORTED_DEVICES: Set[int] = set()
+
+# [新增] 全局缓存：存储流媒体地址，避免频繁请求萤石云API导致并发数达到上限
+# 缓存结构：{video_id: {"url": str, "expired_at": float, "play_type": str, ...}}
+STREAM_URL_CACHE: Dict[int, Dict[str, Any]] = {}
+STREAM_URL_CACHE_LOCK = threading.Lock()
+STREAM_CACHE_VALID_SECONDS = int(os.getenv("VIDEO_STREAM_CACHE_SECONDS", "3300"))  # 缓存有效期3300秒（比token 3600秒短一点）
 
 class VideoService:
+    def _get_ezviz_config(self) -> tuple[str, str, str]:
+        # 运行时读取环境变量，避免导入时机导致配置值为空。
+        base_url = (os.getenv("EZVIZ_BASE_URL") or EZVIZ_BASE_URL or "https://open.ys7.com").rstrip("/")
+        app_key = os.getenv("EZVIZ_APP_KEY") or EZVIZ_APP_KEY or ""
+        app_secret = os.getenv("EZVIZ_APP_SECRET") or EZVIZ_APP_SECRET or ""
+        return base_url, app_key, app_secret
+
     # -------------------------------------------------------------------------
     # 核心 1: 获取连接
     # -------------------------------------------------------------------------
@@ -319,6 +366,9 @@ class VideoService:
         db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
         if not db_video: raise ValueError("Device not found")
 
+        if self._is_ezviz_ptz(db_video):
+            return self._ezviz_ptz_stop(db_video)
+
         try:
             camera, ptz, media = self._get_onvif_service(db_video)
             token = self._get_profile_token(media)
@@ -353,6 +403,9 @@ class VideoService:
     def ptz_start_move(self, db: Session, video_id: int, direction: str, speed: float = 0.5):
         db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
         if not db_video: raise ValueError("Device not found")
+
+        if self._is_ezviz_ptz(db_video):
+            return self._ezviz_ptz_start(db_video, direction, speed)
 
         try:
             camera, ptz, media = self._get_onvif_service(db_video)
@@ -398,6 +451,367 @@ class VideoService:
         except Exception:
             return None
 
+    def _normalize_stream_protocol(self, protocol: Optional[str]) -> str:
+        normalized = (protocol or DEFAULT_STREAM_PROTOCOL or "ezopen").strip().lower()
+        return normalized if normalized in STREAM_PROTOCOL_MAP else "ezopen"
+
+    def _resolve_access_source(self, db_video: VideoDevice) -> str:
+        explicit_source = (getattr(db_video, "access_source", None) or "").strip().lower()
+        if explicit_source in {"cloud", "local"}:
+            return explicit_source
+
+        platform = (getattr(db_video, "platform_type", None) or "").strip().lower()
+        if platform == "ezviz":
+            return "cloud"
+        return "local"
+
+    def _resolve_ptz_source(self, db_video: VideoDevice) -> str:
+        explicit_source = (getattr(db_video, "ptz_source", None) or "").strip().lower()
+        if explicit_source in {"ezviz", "onvif"}:
+            return explicit_source
+
+        platform = (getattr(db_video, "platform_type", None) or "").strip().lower()
+        if platform == "ezviz":
+            return "ezviz"
+        return "onvif"
+
+    def _is_ezviz_access(self, db_video: VideoDevice) -> bool:
+        return self._resolve_access_source(db_video) == "cloud" and bool(getattr(db_video, "device_serial", None))
+
+    def _is_ezviz_ptz(self, db_video: VideoDevice) -> bool:
+        return self._resolve_ptz_source(db_video) == "ezviz" and bool(getattr(db_video, "device_serial", None))
+
+    def _map_error_code(self, raw_code: Any, raw_message: str) -> tuple[str, str]:
+        code_str = str(raw_code or "")
+        msg = raw_message or "调用失败"
+        msg_lower = msg.lower()
+
+        if code_str in TOKEN_ERROR_CODES or "token" in msg_lower:
+            return "TOKEN_EXPIRED", "平台凭证失效，请稍后重试"
+        if "offline" in msg_lower or "设备不在线" in msg or "设备离线" in msg:
+            return "DEVICE_OFFLINE", "设备离线或不可达"
+        if "ptz" in msg_lower and ("not" in msg_lower or "不支持" in msg):
+            return "PTZ_NOT_SUPPORTED", "设备不支持云台控制"
+        if code_str == "60019" or "加密" in msg:
+            return "VIDEO_ENCRYPTED", "视频加密已开启，当前协议不可用"
+        return "UPSTREAM_ERROR", msg
+
+    def _ensure_ezviz_credentials(self):
+        _, app_key, app_secret = self._get_ezviz_config()
+        if not app_key or not app_secret:
+            raise ValueError("UPSTREAM_ERROR: 未配置萤石 AppKey/AppSecret")
+
+    def _request_ezviz_token(self) -> str:
+        self._ensure_ezviz_credentials()
+        base_url, app_key, app_secret = self._get_ezviz_config()
+        url = f"{base_url}/api/lapp/token/get"
+        payload = {"appKey": app_key, "appSecret": app_secret}
+        resp = requests.post(url, data=payload, timeout=8)
+        resp.raise_for_status()
+        body = resp.json() if resp.content else {}
+
+        code = str(body.get("code", ""))
+        if code != "200":
+            semantic_code, semantic_msg = self._map_error_code(code, str(body.get("msg", "获取 token 失败")))
+            raise ValueError(f"{semantic_code}: {semantic_msg}")
+
+        data = body.get("data") or {}
+        token = data.get("accessToken")
+        expire_time = int(data.get("expireTime") or 0)
+        if not token:
+            raise ValueError("UPSTREAM_ERROR: 获取 token 失败")
+
+        if expire_time <= 0:
+            expire_at = time.time() + 6 * 24 * 3600
+        elif expire_time > 10_000_000_000:
+            expire_at = expire_time / 1000.0
+        else:
+            expire_at = float(expire_time)
+
+        EZVIZ_TOKEN_CACHE["access_token"] = token
+        EZVIZ_TOKEN_CACHE["expire_at"] = expire_at
+        return token
+
+    def _get_ezviz_token(self, force_refresh: bool = False) -> str:
+        with EZVIZ_TOKEN_LOCK:
+            token = EZVIZ_TOKEN_CACHE.get("access_token")
+            expire_at = float(EZVIZ_TOKEN_CACHE.get("expire_at") or 0.0)
+            now = time.time()
+            if (not force_refresh) and token and expire_at - now > 120:
+                return str(token)
+            return self._request_ezviz_token()
+
+    def get_ezviz_health(self) -> dict:
+        _, app_key, app_secret = self._get_ezviz_config()
+        try:
+            token = self._get_ezviz_token(force_refresh=False)
+            expire_at = float(EZVIZ_TOKEN_CACHE.get("expire_at") or 0.0)
+            return {
+                "status": "ok",
+                "configured": bool(app_key and app_secret),
+                "token_ready": bool(token),
+                "token_expire_at": int(expire_at),
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "configured": bool(app_key and app_secret),
+                "token_ready": False,
+                "message": str(e),
+            }
+
+    def _call_ezviz_api(self, path: str, payload: dict, retry_on_token_error: bool = True) -> dict:
+        token = self._get_ezviz_token(force_refresh=False)
+        base_url, _, _ = self._get_ezviz_config()
+        url = f"{base_url}{path}"
+        request_payload = dict(payload)
+        request_payload["accessToken"] = token
+
+        resp = requests.post(url, data=request_payload, timeout=8)
+        resp.raise_for_status()
+        body = resp.json() if resp.content else {}
+        code = str(body.get("code", ""))
+        if code == "200":
+            return body
+
+        if retry_on_token_error and code in TOKEN_ERROR_CODES:
+            token = self._get_ezviz_token(force_refresh=True)
+            retry_payload = dict(payload)
+            retry_payload["accessToken"] = token
+            retry_resp = requests.post(url, data=retry_payload, timeout=8)
+            retry_resp.raise_for_status()
+            retry_body = retry_resp.json() if retry_resp.content else {}
+            retry_code = str(retry_body.get("code", ""))
+            if retry_code == "200":
+                return retry_body
+            semantic_code, semantic_msg = self._map_error_code(retry_code, str(retry_body.get("msg", "调用失败")))
+            raise ValueError(f"{semantic_code}: {semantic_msg}")
+
+        semantic_code, semantic_msg = self._map_error_code(code, str(body.get("msg", "调用失败")))
+        raise ValueError(f"{semantic_code}: {semantic_msg}")
+
+    def _get_stream_info_local(self, db_video: VideoDevice) -> dict:
+        # 拉流前执行按需校时：超过阈值才改，且有冷却时间避免频繁写设备。
+        sync_result = self._sync_camera_time_for_video(db_video, force=False)
+        if sync_result.get("status") == "error":
+            logger.warning(f"Auto time sync failed for video_id={db_video.id}: {sync_result.get('message')}")
+
+        # 懒启动推流：当前端请求播放地址时，如推流进程不存在则自动拉起。
+        stream_name = str(db_video.id)
+        entry = FFMPEG_PROCESSES.get(stream_name)
+        is_running = False
+        if entry is not None:
+            try:
+                is_running = entry.poll() is None
+            except Exception:
+                is_running = False
+
+        if not is_running:
+            rtsp_url = self._get_rtsp_url_for_device(db_video)
+            if rtsp_url:
+                self.start_ffmpeg_stream(rtsp_url, stream_name)
+
+        # 拉流阶段顺带做一次录像自愈，确保“设备在线时持续落盘”。
+        record_entry = RECORDING_PROCESSES.get(db_video.id)
+        record_running = False
+        if isinstance(record_entry, dict):
+            record_proc = record_entry.get("process")
+            if record_proc is not None:
+                try:
+                    record_running = record_proc.poll() is None
+                except Exception:
+                    record_running = False
+        elif record_entry is not None:
+            try:
+                record_running = record_entry.poll() is None
+            except Exception:
+                record_running = False
+
+        if not record_running:
+            rtsp_url = self._get_rtsp_url_for_device(db_video)
+            if rtsp_url:
+                self.start_ffmpeg_recording(db_video.id, rtsp_url)
+
+        url = db_video.stream_url or ""
+        play_type = "flv"
+        lowered = str(url).lower()
+        if lowered.startswith("rtsp://"):
+            play_type = "rtsp"
+        elif lowered.endswith(".m3u8"):
+            play_type = "hls"
+        elif lowered.startswith("http") and ".flv" in lowered:
+            play_type = "flv"
+
+        return {
+            "url": url,
+            "play_type": play_type,
+            "platform": "onvif",
+            "device_serial": None,
+            "channel_no": None,
+            "access_token": None,
+        }
+
+    def _get_stream_info_ezviz(self, db_video: VideoDevice) -> dict:
+        protocol_name = self._normalize_stream_protocol(getattr(db_video, "stream_protocol", None))
+        channel_no = int(getattr(db_video, "channel_no", None) or 1)
+        device_serial = str(getattr(db_video, "device_serial", "") or "").strip()
+        if not device_serial:
+            raise ValueError("UPSTREAM_ERROR: 云设备缺少 device_serial")
+
+        preferred_code = STREAM_PROTOCOL_MAP[protocol_name]
+        protocol_candidates = [preferred_code] + [c for c in [1, 2, 3, 4] if c != preferred_code]
+
+        url = ""
+        last_error: Optional[Exception] = None
+        for protocol_code in protocol_candidates:
+            payload = {
+                "deviceSerial": device_serial,
+                "channelNo": channel_no,
+                "protocol": protocol_code,
+                "expireTime": 3600,
+            }
+
+            body = None
+            paths = ["/api/lapp/live/address/get", "/api/lapp/v2/live/address/get"]
+            for path in paths:
+                try:
+                    body = self._call_ezviz_api(path, payload)
+                    break
+                except Exception as e:
+                    last_error = e
+
+            if body is None:
+                continue
+
+            data = body.get("data") or {}
+            url = (
+                data.get("url")
+                or data.get("liveAddress")
+                or data.get("hls")
+                or data.get("rtmp")
+                or data.get("ezopen")
+                or ""
+            )
+            if url:
+                break
+
+        if not url:
+            raise last_error or ValueError("UPSTREAM_ERROR: 平台未返回可用播放地址")
+
+        lower_url = str(url).lower()
+        resolved_play_type = protocol_name
+        if lower_url.startswith("ezopen://"):
+            resolved_play_type = "ezopen"
+        elif ".m3u8" in lower_url:
+            resolved_play_type = "hls"
+        elif lower_url.startswith("rtmp"):
+            resolved_play_type = "rtmp"
+        elif ".flv" in lower_url:
+            resolved_play_type = "flv"
+
+        # 云流场景也要持续落本地分段，供临时缓存/常态回放使用。
+        # 每次取流都尝试自愈；start_ffmpeg_recording 内部会按 source_key 判断是否需要重启。
+        record_source = self._get_record_source_for_device(db_video)
+        if record_source:
+            self.start_ffmpeg_recording(db_video.id, record_source)
+
+        return {
+            "url": url,
+            "play_type": resolved_play_type,
+            "platform": "ezviz",
+            "device_serial": device_serial,
+            "channel_no": channel_no,
+            "access_token": self._get_ezviz_token(force_refresh=False),
+        }
+
+    def _ezviz_ptz_start(self, db_video: VideoDevice, direction: str, speed: float = 0.5):
+        direction_code = EZVIZ_DIRECTION_MAP.get(direction)
+        if direction_code is None:
+            raise ValueError("PTZ_NOT_SUPPORTED: 不支持的 PTZ 方向")
+
+        payload = {
+            "deviceSerial": db_video.device_serial,
+            "channelNo": int(getattr(db_video, "channel_no", None) or 1),
+            "direction": direction_code,
+            "speed": max(1, min(8, int(round(float(speed) * 8)))),
+        }
+        try:
+            self._call_ezviz_api("/api/lapp/device/ptz/start", payload)
+        except Exception as first_error:
+            # 萤石云偶发网络抖动会导致 start 超时，短暂重试一次可提升稳定性。
+            logger.warning(f"EZVIZ PTZ start retry for video_id={db_video.id}: {first_error}")
+            time.sleep(0.15)
+            self._call_ezviz_api("/api/lapp/device/ptz/start", payload)
+        EZVIZ_PTZ_LAST_DIRECTION[db_video.id] = direction_code
+        return {"status": "success"}
+
+    def _ezviz_ptz_stop(self, db_video: VideoDevice):
+        now = time.time()
+        last_stop_at = EZVIZ_PTZ_LAST_STOP_AT.get(db_video.id, 0.0)
+        if now - last_stop_at < 0.35:
+            return {"status": "skipped", "message": "duplicate stop suppressed"}
+        EZVIZ_PTZ_LAST_STOP_AT[db_video.id] = now
+
+        payload = {
+            "deviceSerial": db_video.device_serial,
+            "channelNo": int(getattr(db_video, "channel_no", None) or 1),
+        }
+        last_direction = EZVIZ_PTZ_LAST_DIRECTION.get(db_video.id)
+        if last_direction is not None:
+            payload["direction"] = last_direction
+        try:
+            self._call_ezviz_api("/api/lapp/device/ptz/stop", payload)
+            return {"status": "success"}
+        except Exception as e:
+            # Stop 属于幂等操作，平台超时场景下按降级成功处理，避免前端长按/松开持续报错。
+            logger.warning(f"EZVIZ PTZ stop degraded for video_id={db_video.id}: {e}")
+            return {"status": "degraded", "message": str(e)}
+
+    def get_stream_info(self, db: Session, video_id: int):
+        """
+        获取流媒体地址，优先使用缓存避免频繁请求萤石云API。
+        
+        key point: 缓存机制可大幅降低萤石云并发连接数，解决免费版并发数限制问题。
+        """
+        global STREAM_URL_CACHE
+
+        # 1. 检查缓存是否有效
+        now = time.time()
+        if video_id in STREAM_URL_CACHE:
+            cached = STREAM_URL_CACHE[video_id]
+            if cached.get("expired_at", 0) > now:
+                logger.info(f"✅ 命中流地址缓存 video_id={video_id}")
+                return cached["data"]
+            else:
+                # 缓存已过期，清理
+                del STREAM_URL_CACHE[video_id]
+
+        # 2. 缓存未命中，从数据库和云平台获取
+        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        if not db_video:
+            return None
+
+        try:
+            if self._is_ezviz_access(db_video):
+                data = self._get_stream_info_ezviz(db_video)
+            else:
+                data = self._get_stream_info_local(db_video)
+            
+            # 3. 缓存结果
+            if data and data.get("url"):
+                with STREAM_URL_CACHE_LOCK:
+                    STREAM_URL_CACHE[video_id] = {
+                        "data": data,
+                        "expired_at": now + STREAM_CACHE_VALID_SECONDS,
+                        "cached_at": now,
+                    }
+                logger.info(f"📝 缓存流地址 video_id={video_id}, 有效期={STREAM_CACHE_VALID_SECONDS}秒")
+            
+            return data
+        except Exception as e:
+            logger.error(f"获取流地址失败 video_id={video_id}: {e}")
+            raise
+
     def _create_ptz_and_media(self, db: Session, video_id: int):
         db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
         if not db_video:
@@ -407,6 +821,48 @@ class VideoService:
         return db_video, camera, ptz, media, token
 
     def list_presets(self, db: Session, video_id: int):
+        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        if not db_video:
+            raise ValueError("Device not found")
+
+        if self._is_ezviz_ptz(db_video):
+            if video_id in EZVIZ_PRESET_UNSUPPORTED_DEVICES:
+                return []
+            try:
+                payload = {
+                    "deviceSerial": db_video.device_serial,
+                    "channelNo": int(getattr(db_video, "channel_no", None) or 1),
+                }
+                body = None
+                for path in ["/api/lapp/device/preset/list", "/api/lapp/v2/device/preset/list"]:
+                    try:
+                        body = self._call_ezviz_api(path, payload)
+                        break
+                    except Exception:
+                        body = None
+                if body is None:
+                    EZVIZ_PRESET_UNSUPPORTED_DEVICES.add(video_id)
+                    logger.info(f"EZVIZ presets unsupported or unavailable for video_id={video_id}, skip preset polling")
+                    return []
+                data = body.get("data") or []
+                result = []
+                for item in data:
+                    token = str(item.get("index") or item.get("presetIndex") or item.get("token") or "")
+                    if not token:
+                        continue
+                    result.append({
+                        "token": token,
+                        "name": str(item.get("name") or item.get("presetName") or f"Preset-{token}"),
+                    })
+                return result
+            except Exception as e:
+                if "404" in str(e):
+                    EZVIZ_PRESET_UNSUPPORTED_DEVICES.add(video_id)
+                    logger.info(f"EZVIZ presets unsupported for video_id={video_id}, skip preset polling")
+                else:
+                    logger.warning(f"EZVIZ list presets failed for video_id={video_id}: {e}")
+                return []
+
         try:
             _, _, ptz, _, token = self._create_ptz_and_media(db, video_id)
             presets = ptz.GetPresets({'ProfileToken': token})
@@ -424,6 +880,27 @@ class VideoService:
         return result
 
     def set_preset(self, db: Session, video_id: int, name: Optional[str] = None, preset_token: Optional[str] = None):
+        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        if not db_video:
+            raise ValueError("Device not found")
+
+        if self._is_ezviz_ptz(db_video):
+            payload = {
+                "deviceSerial": db_video.device_serial,
+                "channelNo": int(getattr(db_video, "channel_no", None) or 1),
+            }
+            if name:
+                payload["name"] = name
+            if preset_token:
+                payload["index"] = preset_token
+            body = self._call_ezviz_api("/api/lapp/device/preset/add", payload)
+            data = body.get("data") or {}
+            token = str(data.get("index") or data.get("presetIndex") or preset_token or "")
+            return {
+                "token": token,
+                "name": name or f"Preset-{token}",
+            }
+
         _, _, ptz, _, token = self._create_ptz_and_media(db, video_id)
         req = {'ProfileToken': token}
         if name:
@@ -441,6 +918,19 @@ class VideoService:
             raise ValueError(f"创建预置点失败: {e}")
 
     def goto_preset(self, db: Session, video_id: int, preset_token: str, speed: float = 0.5):
+        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        if not db_video:
+            raise ValueError("Device not found")
+
+        if self._is_ezviz_ptz(db_video):
+            payload = {
+                "deviceSerial": db_video.device_serial,
+                "channelNo": int(getattr(db_video, "channel_no", None) or 1),
+                "index": preset_token,
+            }
+            self._call_ezviz_api("/api/lapp/device/preset/move", payload)
+            return {"status": "success"}
+
         _, _, ptz, _, token = self._create_ptz_and_media(db, video_id)
         req = {
             'ProfileToken': token,
@@ -457,6 +947,19 @@ class VideoService:
             raise ValueError(f"调用预置点失败: {e}")
 
     def remove_preset(self, db: Session, video_id: int, preset_token: str):
+        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        if not db_video:
+            raise ValueError("Device not found")
+
+        if self._is_ezviz_ptz(db_video):
+            payload = {
+                "deviceSerial": db_video.device_serial,
+                "channelNo": int(getattr(db_video, "channel_no", None) or 1),
+                "index": preset_token,
+            }
+            self._call_ezviz_api("/api/lapp/device/preset/clear", payload)
+            return {"status": "success"}
+
         _, _, ptz, _, token = self._create_ptz_and_media(db, video_id)
         req = {'ProfileToken': token, 'PresetToken': preset_token}
         try:
@@ -468,6 +971,29 @@ class VideoService:
     def remove_presets_bulk(self, db: Session, video_id: int, preset_tokens: list[str]):
         if not preset_tokens:
             raise ValueError("preset_tokens 不能为空")
+
+        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        if not db_video:
+            raise ValueError("Device not found")
+
+        if self._is_ezviz_ptz(db_video):
+            unique_tokens: list[str] = list(dict.fromkeys([str(t) for t in preset_tokens if str(t).strip()]))
+            deleted_tokens: list[str] = []
+            failed_tokens: list[str] = []
+            for preset_token in unique_tokens:
+                try:
+                    self.remove_preset(db, video_id, preset_token)
+                    deleted_tokens.append(preset_token)
+                except Exception as e:
+                    logger.warning(f"Bulk remove preset failed video_id={video_id}, token={preset_token}: {e}")
+                    failed_tokens.append(preset_token)
+            return {
+                "total": len(unique_tokens),
+                "deleted": len(deleted_tokens),
+                "failed": len(failed_tokens),
+                "deleted_tokens": deleted_tokens,
+                "failed_tokens": failed_tokens,
+            }
 
         _, _, ptz, _, token = self._create_ptz_and_media(db, video_id)
         unique_tokens: list[str] = list(dict.fromkeys([str(t) for t in preset_tokens if str(t).strip()]))
@@ -523,10 +1049,23 @@ class VideoService:
         if len(preset_tokens) < 2:
             raise ValueError("巡航至少需要两个预置点")
 
-        available = {item["token"] for item in self.list_presets(db, video_id)}
-        missing = [token for token in preset_tokens if token not in available]
-        if missing:
-            raise ValueError(f"以下预置点不存在: {', '.join(missing)}")
+        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        if not db_video:
+            raise ValueError("Device not found")
+
+        available_items = self.list_presets(db, video_id)
+        available = {item["token"] for item in available_items}
+        if available:
+            missing = [token for token in preset_tokens if token not in available]
+            if missing:
+                raise ValueError(f"以下预置点不存在: {', '.join(missing)}")
+        elif not self._is_ezviz_ptz(db_video):
+            raise ValueError("未查询到可用预置点，请先创建预置点")
+        else:
+            logger.warning(
+                "EZVIZ preset list unavailable for video_id=%s, skip strict cruise validation",
+                video_id,
+            )
 
         self.stop_cruise(video_id)
 
@@ -588,6 +1127,17 @@ class VideoService:
             password=camera_data.password,
             stream_url="",
             rtsp_url=camera_data.rtsp_url,
+            stream_protocol=self._normalize_stream_protocol(camera_data.stream_protocol),
+            platform_type=(camera_data.platform_type or "onvif"),
+            access_source=(camera_data.access_source or "local"),
+            ptz_source=(camera_data.ptz_source or "onvif"),
+            device_serial=camera_data.device_serial,
+            channel_no=camera_data.channel_no or 1,
+            supports_ptz=1,
+            supports_preset=1,
+            supports_cruise=1,
+            supports_zoom=1,
+            supports_focus=0,
             latitude=camera_data.latitude,
             longitude=camera_data.longitude,
             status="online",
@@ -620,7 +1170,13 @@ class VideoService:
         return []
 
     def create_video(self, db: Session, video_data: VideoCreate):
-        new_video = VideoDevice(**video_data.model_dump())
+        payload = video_data.model_dump()
+        payload["stream_protocol"] = self._normalize_stream_protocol(payload.get("stream_protocol"))
+        payload["platform_type"] = payload.get("platform_type") or "onvif"
+        payload["access_source"] = payload.get("access_source") or "local"
+        payload["ptz_source"] = payload.get("ptz_source") or "onvif"
+        payload["channel_no"] = payload.get("channel_no") or 1
+        new_video = VideoDevice(**payload)
         db.add(new_video)
         db.commit()
         db.refresh(new_video)
@@ -632,7 +1188,11 @@ class VideoService:
     def update_video(self, db: Session, video_id: int, video_data: VideoUpdate):
         db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
         if not db_video: return None
-        for key, value in video_data.model_dump(exclude_unset=True).items():
+        update_payload = video_data.model_dump(exclude_unset=True)
+        if "stream_protocol" in update_payload:
+            update_payload["stream_protocol"] = self._normalize_stream_protocol(update_payload.get("stream_protocol"))
+
+        for key, value in update_payload.items():
             setattr(db_video, key, value)
 
         if db_video.rtsp_url and (not db_video.stream_url or "/live/" not in str(db_video.stream_url)):
@@ -655,35 +1215,18 @@ class VideoService:
             db.commit()
             if video_id in ONVIF_CLIENT_CACHE:
                 del ONVIF_CLIENT_CACHE[video_id]
+            if video_id in EZVIZ_PTZ_LAST_DIRECTION:
+                del EZVIZ_PTZ_LAST_DIRECTION[video_id]
+            if video_id in EZVIZ_PTZ_LAST_STOP_AT:
+                del EZVIZ_PTZ_LAST_STOP_AT[video_id]
             return True
         return False
 
     def get_stream_url(self, db: Session, video_id: int):
-        v = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
-        if not v:
+        stream_info = self.get_stream_info(db, video_id)
+        if not stream_info:
             return None
-
-        # 拉流前执行按需校时：超过阈值才改，且有冷却时间避免频繁写设备。
-        sync_result = self._sync_camera_time_for_video(v, force=False)
-        if sync_result.get("status") == "error":
-            logger.warning(f"Auto time sync failed for video_id={video_id}: {sync_result.get('message')}")
-
-        # 懒启动推流：当前端请求播放地址时，如推流进程不存在则自动拉起。
-        stream_name = str(v.id)
-        entry = FFMPEG_PROCESSES.get(stream_name)
-        is_running = False
-        if entry is not None:
-            try:
-                is_running = entry.poll() is None
-            except Exception:
-                is_running = False
-
-        if not is_running:
-            rtsp_url = self._get_rtsp_url_for_device(v)
-            if rtsp_url:
-                self.start_ffmpeg_stream(rtsp_url, stream_name)
-
-        return v.stream_url
+        return stream_info.get("url")
         
     def ptz_move(self, db: Session, video_id: int, direction: str, speed: float = 0.5, duration: float = 0.5):
         try:
@@ -693,6 +1236,19 @@ class VideoService:
             return {"status": "success"}
         except Exception as e:
             raise ValueError(f"Move error: {e}")
+
+    def zoom_start_move(self, db: Session, video_id: int, direction: str, speed: float = 0.5):
+        if direction not in {"zoom_in", "zoom_out"}:
+            raise ValueError("Invalid zoom direction. Use zoom_in or zoom_out")
+        return self.ptz_start_move(db, video_id, direction, speed)
+
+    def zoom_stop_move(self, db: Session, video_id: int):
+        return self.ptz_stop_move(db, video_id)
+
+    def zoom_move(self, db: Session, video_id: int, direction: str, speed: float = 0.5, duration: float = 0.5):
+        if direction not in {"zoom_in", "zoom_out"}:
+            raise ValueError("Invalid zoom direction. Use zoom_in or zoom_out")
+        return self.ptz_move(db, video_id, direction, speed, duration)
 
     # -------------------------------------------------------------------------
     # [新功能] V4 极速推流 + 进程管理
@@ -806,6 +1362,11 @@ class VideoService:
         os.makedirs(playback_root, exist_ok=True)
         return playback_root
 
+    def _get_temp_playback_root(self) -> str:
+        temp_root = os.path.join(self._get_playback_video_root(), "temp_cache")
+        os.makedirs(temp_root, exist_ok=True)
+        return temp_root
+
     def _get_rtsp_url_for_device(self, db_video: VideoDevice) -> Optional[str]:
         if getattr(db_video, "rtsp_url", None) and str(db_video.rtsp_url).lower().startswith("rtsp://"):
             return db_video.rtsp_url
@@ -818,17 +1379,100 @@ class VideoService:
 
         return None
 
-    def start_ffmpeg_recording(self, video_id: int, rtsp_url: str):
-        if not rtsp_url:
-            logger.warning(f"录像启动失败，video_id={video_id} 缺少 RTSP 地址")
+    def _get_ezviz_recordable_url(self, db_video: VideoDevice) -> Optional[str]:
+        """为云设备获取可被 FFmpeg 直接录制的地址（优先 flv/hls/rtmp）。"""
+        device_serial = str(getattr(db_video, "device_serial", "") or "").strip()
+        if not device_serial:
+            return None
+
+        channel_no = int(getattr(db_video, "channel_no", None) or 1)
+        protocol_candidates = [4, 2, 3, 1]  # flv, hls, rtmp, ezopen
+        paths = ["/api/lapp/live/address/get", "/api/lapp/v2/live/address/get"]
+
+        for protocol_code in protocol_candidates:
+            payload = {
+                "deviceSerial": device_serial,
+                "channelNo": channel_no,
+                "protocol": protocol_code,
+                "expireTime": 3600,
+            }
+
+            body = None
+            for path in paths:
+                try:
+                    body = self._call_ezviz_api(path, payload)
+                    break
+                except Exception:
+                    body = None
+
+            if body is None:
+                continue
+
+            data = body.get("data") or {}
+            url = (
+                data.get("url")
+                or data.get("liveAddress")
+                or data.get("flv")
+                or data.get("hls")
+                or data.get("rtmp")
+                or data.get("ezopen")
+                or ""
+            )
+            lower_url = str(url).lower()
+            if not url:
+                continue
+            if lower_url.startswith("ezopen://"):
+                continue
+            if lower_url.startswith("http://") or lower_url.startswith("https://") or lower_url.startswith("rtmp://") or lower_url.startswith("rtsp://"):
+                return str(url)
+
+        return None
+
+    def _get_record_source_for_device(self, db_video: VideoDevice) -> Optional[str]:
+        if self._is_ezviz_access(db_video):
+            ezviz_url = self._get_ezviz_recordable_url(db_video)
+            if ezviz_url:
+                return ezviz_url
+
+        rtsp_url = self._get_rtsp_url_for_device(db_video)
+        if rtsp_url:
+            return rtsp_url
+
+        return None
+
+    def _normalize_record_source_for_compare(self, source_url: str) -> str:
+        """比较录制源时去掉临时 token 参数，避免云地址每次刷新触发无意义重启。"""
+        raw = str(source_url or "").strip()
+        if not raw:
+            return ""
+
+        lower = raw.lower()
+        if lower.startswith("rtsp://"):
+            return raw
+
+        try:
+            parsed = urlparse(raw)
+            # 对云流地址仅比较 scheme/netloc/path，忽略 query 中的 expire/id/t。
+            if parsed.scheme in {"http", "https", "rtmp", "rtmps"}:
+                return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        except Exception:
+            pass
+
+        return raw
+
+    def start_ffmpeg_recording(self, video_id: int, source_url: str):
+        if not source_url:
+            logger.warning(f"录像启动失败，video_id={video_id} 缺少可录制地址")
             return None
 
         # 如果同一路录像进程正在运行且源地址未变，不要重启。
+        source_key = self._normalize_record_source_for_compare(source_url)
         existing = RECORDING_PROCESSES.get(video_id)
         if isinstance(existing, dict):
             existing_process = existing.get("process")
-            existing_rtsp = existing.get("rtsp_url")
-            if existing_process and existing_process.poll() is None and existing_rtsp == rtsp_url:
+            existing_source = existing.get("source_url") or existing.get("rtsp_url")
+            existing_source_key = existing.get("source_key") or self._normalize_record_source_for_compare(str(existing_source or ""))
+            if existing_process and existing_process.poll() is None and existing_source_key == source_key:
                 return existing_process
         elif existing is not None:
             try:
@@ -850,18 +1494,23 @@ class VideoService:
         # 直接写到设备目录，避免日期子目录不存在导致 ffmpeg 无法落盘。
         segment_pattern = os.path.join(device_root, "%Y%m%d_%H%M%S.mp4")
 
+        source_lower = str(source_url).lower()
+        input_options: list[str] = []
+        if source_lower.startswith("rtsp://"):
+            input_options.extend(["-rtsp_transport", "tcp"])
+
         command = [
             ffmpeg_path,
             "-y",
-            "-rtsp_transport", "tcp",
+            *input_options,
             "-use_wallclock_as_timestamps", "1",
-            "-i", rtsp_url,
+            "-i", source_url,
             "-map", "0:v:0",
             "-map", "0:a:0?",
             "-c:v", "copy",
             "-c:a", "aac",
             "-f", "segment",
-            "-segment_time", "60",
+            "-segment_time", str(RECORD_SEGMENT_SECONDS),
             "-segment_atclocktime", "1",
             "-strftime", "1",
             "-reset_timestamps", "1",
@@ -881,7 +1530,8 @@ class VideoService:
             RECORDING_PROCESSES[video_id] = {
                 "process": process,
                 "log_file": log_file,
-                "rtsp_url": rtsp_url,
+                "source_url": source_url,
+                "source_key": source_key,
             }
             return process
         except Exception as e:
@@ -925,11 +1575,11 @@ class VideoService:
             if not os.path.exists(file_path):
                 return False
 
-            # 录像按 60 秒分段，至少等待一个完整分段周期再参与拼接，
+            # 录像按固定分段时长切片，至少等待一个完整分段周期再参与拼接，
             # 避免把仍在写入中的当前分段加入 concat。
             seg_start = self._parse_segment_start(file_path)
             if seg_start:
-                if (datetime.now() - seg_start).total_seconds() < 68:
+                if (datetime.now() - seg_start).total_seconds() < (RECORD_SEGMENT_SECONDS + RECORD_SEGMENT_SAFE_MARGIN_SECONDS):
                     return False
 
             stat = os.stat(file_path)
@@ -987,9 +1637,9 @@ class VideoService:
                         continue
                 except Exception:
                     pass
-            rtsp_url = self._get_rtsp_url_for_device(v)
-            if rtsp_url:
-                self.start_ffmpeg_recording(v.id, rtsp_url)
+            record_source = self._get_record_source_for_device(v)
+            if record_source:
+                self.start_ffmpeg_recording(v.id, record_source)
 
     def _parse_datetime_input(self, value: datetime | str) -> datetime:
         if isinstance(value, datetime):
@@ -1033,7 +1683,7 @@ class VideoService:
             if not seg_start:
                 continue
 
-            seg_end = seg_start + timedelta(seconds=60)
+            seg_end = seg_start + timedelta(seconds=RECORD_SEGMENT_SECONDS)
             if seg_end <= start_dt or seg_start >= end_dt:
                 continue
             if not self._is_segment_usable(seg_path):
@@ -1042,6 +1692,95 @@ class VideoService:
             candidates.append((seg_path, seg_start, seg_end))
 
         return candidates
+
+    def _floor_to_archive_slot(self, dt: datetime) -> datetime:
+        floored_hour = dt.hour - (dt.hour % PLAYBACK_ARCHIVE_WINDOW_HOURS)
+        return dt.replace(hour=floored_hour, minute=0, second=0, microsecond=0)
+
+    def _auto_archive_periodic_playback(self, video_id: int):
+        now_ts = time.time()
+        last_run_at = PERIODIC_ARCHIVE_LAST_RUN_AT.get(video_id, 0.0)
+        if now_ts - last_run_at < 60:
+            return
+        PERIODIC_ARCHIVE_LAST_RUN_AT[video_id] = now_ts
+
+        now = datetime.now()
+        current_slot_start = self._floor_to_archive_slot(now)
+        lookback_start = current_slot_start - timedelta(hours=PLAYBACK_ARCHIVE_LOOKBACK_HOURS)
+
+        record_root = self._get_record_root()
+        device_root = os.path.join(record_root, str(video_id))
+        if not os.path.isdir(device_root):
+            return
+
+        periodic_slots: set[datetime] = set()
+        for seg_path in glob.glob(os.path.join(device_root, "*.mp4")):
+            seg_start = self._parse_segment_start(seg_path)
+            if not seg_start:
+                continue
+            slot_start = self._floor_to_archive_slot(seg_start)
+            if slot_start < lookback_start or slot_start >= current_slot_start:
+                continue
+            periodic_slots.add(slot_start)
+
+        if not periodic_slots:
+            return
+
+        output_root = self._get_playback_video_root()
+        for slot_start in sorted(periodic_slots):
+            slot_end = slot_start + timedelta(hours=PLAYBACK_ARCHIVE_WINDOW_HOURS)
+            existing_pattern = os.path.join(
+                output_root,
+                f"periodic_{PLAYBACK_ARCHIVE_WINDOW_HOURS}h_{slot_start.strftime('%Y%m%d_%H%M%S')}_{video_id}_{slot_start.strftime('%Y%m%d_%H%M%S')}_{slot_end.strftime('%Y%m%d_%H%M%S')}.mp4",
+            )
+            if os.path.exists(existing_pattern):
+                continue
+
+            try:
+                self.save_playback_clip(
+                    video_id,
+                    slot_start,
+                    slot_end,
+                    output_type="playback",
+                    filename_prefix=f"periodic_{PLAYBACK_ARCHIVE_WINDOW_HOURS}h_{slot_start.strftime('%Y%m%d_%H%M%S')}",
+                )
+            except Exception as e:
+                logger.debug(
+                    "periodic archive skip video_id=%s slot=%s reason=%s",
+                    video_id,
+                    slot_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    str(e),
+                )
+
+    def list_recording_segments(self, video_id: int, limit: int = 72):
+        self._auto_archive_periodic_playback(video_id)
+        record_root = self._get_record_root()
+        device_root = os.path.join(record_root, str(video_id))
+        if not os.path.isdir(device_root):
+            return []
+
+        segments = []
+        for seg_path in sorted(glob.glob(os.path.join(device_root, "*.mp4")), reverse=True):
+            seg_start = self._parse_segment_start(seg_path)
+            if not seg_start:
+                continue
+            if not self._is_segment_usable(seg_path):
+                continue
+
+            seg_end = seg_start + timedelta(seconds=RECORD_SEGMENT_SECONDS)
+            segments.append({
+                "name": os.path.basename(seg_path),
+                "start_time": seg_start.strftime("%Y-%m-%d %H:%M:%S"),
+                "end_time": seg_end.strftime("%Y-%m-%d %H:%M:%S"),
+                "duration_seconds": RECORD_SEGMENT_SECONDS,
+                "size_bytes": int(os.path.getsize(seg_path)),
+                "web_path": self._to_static_web_path(seg_path),
+            })
+
+            if len(segments) >= max(1, min(limit, 720)):
+                break
+
+        return segments
 
     def save_playback_clip(self, video_id: int, start_time: datetime | str, end_time: datetime | str, output_type: str = "playback", filename_prefix: Optional[str] = None):
         start_dt = self._parse_datetime_input(start_time)
@@ -1053,7 +1792,12 @@ class VideoService:
         if not segments:
             raise ValueError("所选时间段没有可用录像分段")
 
-        output_root = self._get_alarm_video_root() if output_type == "alarm" else self._get_playback_video_root()
+        if output_type == "alarm":
+            output_root = self._get_alarm_video_root()
+        elif output_type == "temp":
+            output_root = self._get_temp_playback_root()
+        else:
+            output_root = self._get_playback_video_root()
         os.makedirs(output_root, exist_ok=True)
 
         ffmpeg_path = self._get_ffmpeg_path()
@@ -1156,3 +1900,103 @@ class VideoService:
                         os.remove(temp_file)
                 except Exception:
                     pass
+
+    def save_temp_cache_until_now(self, video_id: int):
+        now = datetime.now().replace(microsecond=0)
+        current_slot_start = self._floor_to_archive_slot(now)
+
+        if now <= current_slot_start:
+            start_dt = current_slot_start - timedelta(hours=PLAYBACK_ARCHIVE_WINDOW_HOURS)
+        else:
+            start_dt = current_slot_start
+
+        if now <= start_dt:
+            raise ValueError("当前时间窗口无可缓存内容")
+
+        # 若当前窗口并非从起点就开始有分段（例如服务刚恢复），允许从窗口内最早可用分段开始生成。
+        available_segments = self._collect_segments_for_timerange(video_id, start_dt, now)
+        if not available_segments:
+            raise ValueError("当前时间窗口无可缓存内容")
+        effective_start_dt = max(start_dt, available_segments[0][1])
+
+        result = self.save_playback_clip(
+            video_id,
+            effective_start_dt,
+            now,
+            output_type="temp",
+            filename_prefix=f"tempcache_{effective_start_dt.strftime('%Y%m%d_%H%M%S')}",
+        )
+        self._prune_temp_cache_videos(video_id, keep_latest=3)
+        result["cache_window_start"] = effective_start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        result["cache_window_end"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        result["archive_window_hours"] = PLAYBACK_ARCHIVE_WINDOW_HOURS
+        return result
+
+    def _prune_temp_cache_videos(self, video_id: int, keep_latest: int = 3):
+        """每个设备仅保留最近 keep_latest 个临时缓存视频，超过则删除最早的。"""
+        keep_latest = max(1, int(keep_latest))
+        temp_root = self._get_temp_playback_root()
+        if not os.path.isdir(temp_root):
+            return
+
+        matched_files: list[tuple[float, str]] = []
+        pattern = os.path.join(temp_root, "*.mp4")
+        for file_path in glob.glob(pattern):
+            file_name = os.path.basename(file_path)
+            if f"_{video_id}_" not in file_name:
+                continue
+            try:
+                mtime = os.path.getmtime(file_path)
+                matched_files.append((mtime, file_path))
+            except Exception:
+                continue
+
+        if len(matched_files) <= keep_latest:
+            return
+
+        matched_files.sort(key=lambda item: item[0], reverse=True)
+        stale_files = matched_files[keep_latest:]
+
+        for _, stale_path in stale_files:
+            try:
+                if os.path.exists(stale_path):
+                    os.remove(stale_path)
+            except Exception as e:
+                logger.warning(f"Failed to prune temp cache file: {stale_path}, reason: {e}")
+
+    def _list_saved_videos(self, root_dir: str, video_id: int, limit: int = 120) -> list[dict]:
+        if not os.path.isdir(root_dir):
+            return []
+
+        clips: list[dict] = []
+        for file_path in sorted(glob.glob(os.path.join(root_dir, "*.mp4")), reverse=True):
+            file_name = os.path.basename(file_path)
+            if f"_{video_id}_" not in file_name:
+                continue
+
+            try:
+                stat = os.stat(file_path)
+                clips.append(
+                    {
+                        "name": file_name,
+                        "size_bytes": int(stat.st_size),
+                        "updated_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                        "web_path": self._to_static_web_path(file_path),
+                    }
+                )
+            except Exception:
+                continue
+
+            if len(clips) >= max(1, min(limit, 500)):
+                break
+
+        return clips
+
+    def list_saved_playback_videos(self, video_id: int, limit: int = 120) -> list[dict]:
+        return self._list_saved_videos(self._get_playback_video_root(), video_id, limit)
+
+    def list_saved_alarm_videos(self, video_id: int, limit: int = 120) -> list[dict]:
+        return self._list_saved_videos(self._get_alarm_video_root(), video_id, limit)
+
+    def list_temp_cache_videos(self, video_id: int, limit: int = 30) -> list[dict]:
+        return self._list_saved_videos(self._get_temp_playback_root(), video_id, limit)

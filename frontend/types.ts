@@ -1,6 +1,7 @@
 export enum MenuKey {
   DASHBOARD = 'dashboard',
   VIDEO = 'video',
+  VIDEO_PLAYBACK = 'video_playback',
   TRACK = 'track',
   FENCE = 'fence',
   GROUP_CALL = 'group_call',

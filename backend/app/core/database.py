@@ -34,6 +34,17 @@ def ensure_schema_compatibility():
         },
         "video_devices": {
             "rtsp_url": "ALTER TABLE video_devices ADD COLUMN rtsp_url TEXT NULL",
+            "stream_protocol": "ALTER TABLE video_devices ADD COLUMN stream_protocol VARCHAR(20) NULL",
+            "platform_type": "ALTER TABLE video_devices ADD COLUMN platform_type VARCHAR(20) NULL",
+            "access_source": "ALTER TABLE video_devices ADD COLUMN access_source VARCHAR(20) NULL",
+            "ptz_source": "ALTER TABLE video_devices ADD COLUMN ptz_source VARCHAR(20) NULL",
+            "device_serial": "ALTER TABLE video_devices ADD COLUMN device_serial VARCHAR(100) NULL",
+            "channel_no": "ALTER TABLE video_devices ADD COLUMN channel_no INT NULL",
+            "supports_ptz": "ALTER TABLE video_devices ADD COLUMN supports_ptz INT NOT NULL DEFAULT 1",
+            "supports_preset": "ALTER TABLE video_devices ADD COLUMN supports_preset INT NOT NULL DEFAULT 1",
+            "supports_cruise": "ALTER TABLE video_devices ADD COLUMN supports_cruise INT NOT NULL DEFAULT 1",
+            "supports_zoom": "ALTER TABLE video_devices ADD COLUMN supports_zoom INT NOT NULL DEFAULT 1",
+            "supports_focus": "ALTER TABLE video_devices ADD COLUMN supports_focus INT NOT NULL DEFAULT 0",
         },
     }
 

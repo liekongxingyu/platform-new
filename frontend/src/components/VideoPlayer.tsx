@@ -2,15 +2,22 @@ import React, { useEffect, useRef, useState } from 'react';
 
 interface VideoPlayerProps {
   src: string;
+  playType?: string;
+  accessToken?: string;
   onError?: (error: string) => void;
 }
 
-const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, onError }) => {
+const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, playType, accessToken, onError }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const ezContainerRef = useRef<HTMLDivElement>(null);
+  const ezContainerIdRef = useRef(`ez-player-${Math.random().toString(36).slice(2)}`);
   const playerRef = useRef<any>(null);
+  const ezPlayerRef = useRef<any>(null);
   const retryCountRef = useRef(0);
   const retryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error'>('connecting');
+  const [useIframeFallback, setUseIframeFallback] = useState(false);
+  const [iframeLoaded, setIframeLoaded] = useState(false);
 
   const maxRetries = 10; // 增加到10次
   const retryDelay = 1000; // 减少到1秒，让重试更频繁
@@ -29,10 +36,57 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, onError }) => {
         console.warn('Error destroying player:', e);
       }
     }
+
+    if (ezPlayerRef.current) {
+      try {
+        ezPlayerRef.current.stop?.();
+        ezPlayerRef.current.destroy?.();
+      } catch (e) {
+        console.warn('Error destroying EZUIKit player:', e);
+      } finally {
+        ezPlayerRef.current = null;
+      }
+    }
   };
 
   const initPlayer = () => {
     try {
+      const effectivePlayType = (playType || '').toLowerCase();
+      const isEzopen = effectivePlayType === 'ezopen' || (src || '').toLowerCase().startsWith('ezopen://');
+
+      if (isEzopen) {
+        const EZUIKit = (window as any).EZUIKit;
+        if (EZUIKit && ezContainerRef.current) {
+          try {
+            const PlayerCtor = EZUIKit.EZUIKitPlayer || EZUIKit.EZUIPlayer;
+            if (!PlayerCtor) {
+              throw new Error('SDK 已加载但未找到可用播放器构造器');
+            }
+            ezPlayerRef.current = new PlayerCtor({
+              id: ezContainerIdRef.current,
+              url: src,
+              accessToken: accessToken,
+              autoplay: true,
+              width: '100%',
+              height: '100%'
+            });
+            setConnectionStatus('connected');
+            setUseIframeFallback(false);
+            return;
+          } catch (e: any) {
+            // SDK 构造失败时切换到 iframe 兜底，不立即判定为失败。
+            setConnectionStatus('connecting');
+            setUseIframeFallback(true);
+            onError?.(`萤石播放器初始化失败，已切换备用播放通道: ${e?.message || e}`);
+            return;
+          }
+        }
+        setConnectionStatus('connecting');
+        setUseIframeFallback(true);
+        onError?.('当前页面未加载萤石播放器 SDK，已切换备用播放通道');
+        return;
+      }
+
       if (!videoRef.current) return;
 
       const flvjs = (window as any).flvjs;
@@ -175,16 +229,52 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, onError }) => {
     console.log('Video source changed:', src);
     retryCountRef.current = 0; // 重置重试计数
     setConnectionStatus('connecting');
+    setUseIframeFallback(false);
+    setIframeLoaded(false);
     initPlayer();
 
     return () => {
       console.log('Cleaning up video player');
       cleanupPlayer();
     };
-  }, [src]);
+  }, [src, playType, accessToken]);
 
   return (
     <div className="w-full h-full bg-black rounded-lg overflow-hidden relative">
+      {(playType || '').toLowerCase() === 'ezopen' || (src || '').toLowerCase().startsWith('ezopen://') ? (
+        <div className="w-full h-full flex flex-col items-center justify-center text-white gap-3 p-4">
+          {useIframeFallback ? (
+            <iframe
+              className="w-full h-full border-0"
+              src={`https://open.ys7.com/ezopen/h5/iframe?url=${encodeURIComponent(src)}&autoplay=1&accessToken=${encodeURIComponent(accessToken || '')}`}
+              allow="autoplay; fullscreen"
+              title="ezopen-player"
+              onLoad={() => {
+                setIframeLoaded(true);
+                setConnectionStatus('connected');
+              }}
+              onError={() => {
+                setIframeLoaded(false);
+                setConnectionStatus('error');
+                onError?.('备用播放器加载失败，请检查 token、设备在线状态或浏览器策略');
+              }}
+            />
+          ) : (
+            <div id={ezContainerIdRef.current} ref={ezContainerRef} className="w-full h-full" />
+          )}
+          {connectionStatus === 'error' && !useIframeFallback && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 p-4 text-center">
+              <div className="text-lg font-semibold">EZOPEN 播放器不可用</div>
+              <div className="text-sm text-gray-300 mt-2 break-all">{src}</div>
+            </div>
+          )}
+          {useIframeFallback && !iframeLoaded && connectionStatus === 'connecting' && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/55 p-4 text-center">
+              <div className="text-sm text-gray-200">正在加载备用播放器...</div>
+            </div>
+          )}
+        </div>
+      ) : (
       <video
         ref={videoRef}
         className="w-full h-full object-contain"
@@ -192,6 +282,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, onError }) => {
         autoPlay
         muted // 添加 muted 避免浏览器自动播放策略限制
       />
+      )}
       
       {/* 连接状态指示器 */}
       <div className="absolute top-2 right-2 flex items-center gap-2 bg-black/60 px-3 py-1 rounded text-xs">
@@ -208,7 +299,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ src, onError }) => {
       </div>
       
       {/* 错误提示 */}
-      {connectionStatus === 'error' && (
+      {connectionStatus === 'error' && !((playType || '').toLowerCase() === 'ezopen' || (src || '').toLowerCase().startsWith('ezopen://')) && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/80">
           <div className="text-center text-white p-6">
             <div className="text-4xl mb-4">⚠️</div>

@@ -3,10 +3,14 @@ import logging
 import threading
 import asyncio
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketDisconnect
+
+# 在模块导入阶段加载 .env，避免依赖 __main__ 分支导致配置失效
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 from app.core.database import engine, Base, SessionLocal, ensure_schema_compatibility
 from app.controllers import (
@@ -21,7 +25,7 @@ from app.controllers import (
     project_controller,
 )
 from app.utils.logger import get_logger
-from app.core.ws_manager import alarm_clients
+from app.core.ws_manager import alarm_clients, set_main_event_loop
 from app.services.video_service import VideoService
 from app.services.jt808_service import jt808_manager
 
@@ -36,6 +40,7 @@ logger = get_logger("Main")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 【启动阶段】
+    set_main_event_loop(asyncio.get_running_loop())
     logger.info("Initializing system services...")
     
     # 1. 启动 JT808 TCP 服务线程
@@ -58,6 +63,7 @@ async def lifespan(app: FastAPI):
     yield
     
     # 【关闭阶段】
+    set_main_event_loop(None)
     logger.info("Shutting down services...")
     jt808_manager.running = False
 
@@ -114,8 +120,6 @@ async def alarm_ws(websocket: WebSocket):
 # --- 启动入口 ---
 if __name__ == "__main__":
     import uvicorn
-    from dotenv import load_dotenv
-    load_dotenv()
     
     host = os.getenv("BACKEND_HOST", "0.0.0.0")
     port = int(os.getenv("BACKEND_PORT", 9000))

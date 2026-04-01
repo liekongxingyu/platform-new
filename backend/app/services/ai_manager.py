@@ -4,13 +4,15 @@ import cv2
 import os
 import uuid
 import re
+import requests
+import numpy as np
 from datetime import datetime, timedelta
 from app.services.ai_service import AIService
 from app.models.alarm_records import AlarmRecord
+from app.models.video import VideoDevice
 from app.core.database import SessionLocal
 from app.services import ai_features
-import threading
-from app.services.video_service import VideoService
+from app.services.video_service import VideoService, RECORD_SEGMENT_SECONDS, RECORD_SEGMENT_SAFE_MARGIN_SECONDS
 from urllib.parse import urlsplit, urlunsplit, unquote, quote
 
 
@@ -82,28 +84,126 @@ class AIManager:
             return False
 
         ai_rtsp_url, record_rtsp_url = self._plan_ai_and_record_rtsp(rtsp_url)
-        if not ai_rtsp_url:
-            print("❌ AI 启动失败：RTSP 地址为空")
-            return False
+        monitor_mode = "rtsp"
+        ezviz_serial = ""
+        ezviz_channel = 1
 
-        print(f"--- 启动 AI 监控: {device_id} | 功能: {algo_type} ---")
-        print(f"🎯 AI拉流地址: {ai_rtsp_url}")
-        print(f"💾 录像拉流地址: {record_rtsp_url}")
+        if not ai_rtsp_url:
+            db = SessionLocal()
+            try:
+                db_video = None
+                if device_id.isdigit():
+                    db_video = db.query(VideoDevice).filter(VideoDevice.id == int(device_id)).first()
+
+                if db_video and getattr(db_video, "device_serial", None):
+                    ezviz_serial = str(getattr(db_video, "device_serial", "") or "").strip()
+                    ezviz_channel = int(getattr(db_video, "channel_no", 1) or 1)
+                    monitor_mode = "ezviz_snapshot"
+                else:
+                    print("❌ AI 启动失败：RTSP 地址为空，且设备未配置萤石云序列号")
+                    return False
+            finally:
+                db.close()
+
+        print(f"--- 启动 AI 监控: {device_id} | 功能: {algo_type} | 模式: {monitor_mode} ---")
+        if monitor_mode == "rtsp":
+            print(f"🎯 AI拉流地址: {ai_rtsp_url}")
+            print(f"💾 录像拉流地址: {record_rtsp_url}")
+        else:
+            print(f"☁️ 萤石抓图序列号: {ezviz_serial} | 通道: {ezviz_channel}")
 
         stop_event = threading.Event()
-        thread = threading.Thread(
-            target=self._monitor_loop,
-            args=(device_id, ai_rtsp_url, record_rtsp_url, algo_type, stop_event),
-            daemon=True,
-        )
+        if monitor_mode == "rtsp":
+            thread = threading.Thread(
+                target=self._monitor_loop,
+                args=(device_id, ai_rtsp_url, record_rtsp_url, algo_type, stop_event),
+                daemon=True,
+            )
+        else:
+            thread = threading.Thread(
+                target=self._snapshot_monitor_loop,
+                args=(device_id, ezviz_serial, ezviz_channel, algo_type, stop_event),
+                daemon=True,
+            )
 
         self.active_monitors[device_id] = {
             "stop_event": stop_event,
             "thread": thread,
+            "mode": monitor_mode,
         }
 
         thread.start()
         return True
+
+    def _fetch_ezviz_snapshot_frame(self, device_serial: str, channel_no: int):
+        payload = {
+            "deviceSerial": device_serial,
+            "channelNo": int(channel_no or 1),
+        }
+
+        body = None
+        for path in ["/api/lapp/device/capture", "/api/lapp/v2/device/capture"]:
+            try:
+                body = self.video_service._call_ezviz_api(path, payload)
+                break
+            except Exception:
+                body = None
+
+        if body is None:
+            return None
+
+        data = body.get("data") or {}
+        pic_url = data.get("picUrl") or data.get("url") or data.get("picURL") or ""
+        if not pic_url:
+            return None
+
+        try:
+            response = requests.get(pic_url, timeout=8)
+            if response.status_code != 200 or not response.content:
+                return None
+
+            np_buf = np.frombuffer(response.content, dtype=np.uint8)
+            frame = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
+            return frame
+        except Exception:
+            return None
+
+    def _snapshot_monitor_loop(self, device_id, device_serial, channel_no, algo_type_str, stop_event):
+        active_algos = [x.strip() for x in algo_type_str.split(",") if x.strip()]
+        # 萤石抓图接口开销较高，默认 1.2s 一帧，必要时可通过环境变量调优。
+        interval_seconds = max(0.8, float(os.getenv("AI_EZVIZ_SNAPSHOT_INTERVAL_SECONDS", "1.2")))
+
+        print(f"📸 萤石抓图检测启动: serial={device_serial}, channel={channel_no}, interval={interval_seconds}s")
+
+        while not stop_event.is_set():
+            loop_started_at = time.time()
+            frame = self._fetch_ezviz_snapshot_frame(device_serial, channel_no)
+
+            if frame is None:
+                if stop_event.wait(1.0):
+                    break
+                continue
+
+            try:
+                for algo_key in active_algos:
+                    if algo_key not in self.algo_handlers:
+                        print(f"⚠️ 未识别算法类型: {algo_key}")
+                        continue
+
+                    is_alarm, details = self.algo_handlers[algo_key](frame)
+
+                    if is_alarm:
+                        img_path = self._save_alarm_image(frame, device_id, details)
+                        self._save_alarm_to_db(device_id, details, img_path)
+            except Exception as logic_error:
+                print(f"⚠️ 抓图检测逻辑异常: {logic_error}")
+
+            elapsed = time.time() - loop_started_at
+            wait_seconds = max(0.0, interval_seconds - elapsed)
+            if stop_event.wait(wait_seconds):
+                break
+
+        print(f"--- 抓图监控线程已退出: {device_id} ---")
 
     # =========================
     # 停止监控
@@ -319,31 +419,40 @@ class AIManager:
                 self._update_alarm_recording_status(alarm_id, "failed", None, "device_id 非摄像头ID，无法自动录像")
                 return
 
-            wait_seconds = (alarm_time + timedelta(minutes=2, seconds=3) - datetime.now()).total_seconds()
+            # 等待到“报警后2分钟窗口”结束，且尾部分段达到可拼接成熟期，避免末段仍在写入导致失败。
+            mature_buffer = RECORD_SEGMENT_SECONDS + RECORD_SEGMENT_SAFE_MARGIN_SECONDS
+            wait_seconds = (alarm_time + timedelta(minutes=2, seconds=mature_buffer) - datetime.now()).total_seconds()
             if wait_seconds > 0:
-                time.sleep(min(wait_seconds, 180))
+                time.sleep(min(wait_seconds, 300))
 
             clip_start = alarm_time - timedelta(minutes=2)
             clip_end = alarm_time + timedelta(minutes=2)
 
-            try:
-                result = self.video_service.save_playback_clip(
-                    video_id,
-                    clip_start,
-                    clip_end,
-                    output_type="alarm",
-                    filename_prefix=f"alarm_{alarm_id}",
-                )
-                self._update_alarm_recording_status(
-                    alarm_id,
-                    "saved",
-                    result.get("recording_path"),
-                    None,
-                )
-                print(f"✅ 报警视频已保存 (alarm_id={alarm_id}): {result.get('recording_path')}")
-            except Exception as e:
-                self._update_alarm_recording_status(alarm_id, "failed", None, str(e))
-                print(f"❌ 报警视频保存失败 (alarm_id={alarm_id}): {e}")
+            last_error = None
+            for attempt in range(1, 3):
+                try:
+                    result = self.video_service.save_playback_clip(
+                        video_id,
+                        clip_start,
+                        clip_end,
+                        output_type="alarm",
+                        filename_prefix=f"alarm_{alarm_id}",
+                    )
+                    self._update_alarm_recording_status(
+                        alarm_id,
+                        "saved",
+                        result.get("recording_path"),
+                        None,
+                    )
+                    print(f"✅ 报警视频已保存 (alarm_id={alarm_id}): {result.get('recording_path')}")
+                    return
+                except Exception as e:
+                    last_error = e
+                    if attempt < 2:
+                        time.sleep(max(8, RECORD_SEGMENT_SAFE_MARGIN_SECONDS))
+
+            self._update_alarm_recording_status(alarm_id, "failed", None, str(last_error))
+            print(f"❌ 报警视频保存失败 (alarm_id={alarm_id}): {last_error}")
 
         threading.Thread(target=_worker, daemon=True).start()
 

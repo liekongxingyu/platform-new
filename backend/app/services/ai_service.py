@@ -5,7 +5,7 @@ from ultralytics import YOLO
 import numpy as np
 
 import app.services.ai_features
-from app.core.ws_manager import push_alarm
+from app.core.ws_manager import push_alarm, push_alarm_threadsafe
 import asyncio
 
 
@@ -138,9 +138,9 @@ class AIService:
             loop = asyncio.get_running_loop()
             loop.create_task(push_alarm(data))
         except RuntimeError:
-            # 当前线程没有事件循环（AI 检测线程常见），直接启动临时循环执行协程
+            # 当前线程没有事件循环（AI 检测线程常见），投递到主事件循环。
             try:
-                asyncio.run(push_alarm(data))
+                push_alarm_threadsafe(data)
             except Exception as e:
                 print(f"⚠️ WebSocket 推送失败: {e}")
         except Exception as e:

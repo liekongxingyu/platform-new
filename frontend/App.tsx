@@ -23,6 +23,7 @@ import Dashboard from './views/Dashboard';
 import FenceManagement from './views/Fence/index';
 import ProjectManagement from './views/Project/index';
 import VideoCenter from './views/VideoCenter';
+import VideoPlayback from './views/VideoPlayback';
 import TrackPlayback from './views/TrackPlayback';
 import SettingsView from './views/SettingsView';
 import GroupCall from './views/GroupCall';
@@ -191,6 +192,7 @@ const Sidebar = ({
   const menuItems = [
     { key: MenuKey.DASHBOARD, label: '现场管理', icon: LayoutDashboard },
     { key: MenuKey.VIDEO, label: '视频中心', icon: Video },
+    { key: MenuKey.VIDEO_PLAYBACK, label: '视频回放', icon: MapPin },
     // { key: MenuKey.TRACK, label: '轨迹回放', icon: MapPin },
     { key: MenuKey.FENCE, label: '电子围栏', icon: ShieldAlert },
     { key: MenuKey.PROJECT, label: '项目管理', icon: Briefcase },
@@ -211,9 +213,9 @@ const Sidebar = ({
       </div>
 
       <nav className="flex-1 overflow-y-auto py-4">
-        {menuItems.map((item) => (
+        {menuItems.map((item, idx) => (
           <button
-            key={item.key}
+            key={`${item.key}-${idx}`}
             onClick={() => setActiveMenu(item.key)}
             className={`w-full flex items-center gap-3 px-6 py-4 text-sm transition-all duration-200 border-l-4
               ${activeMenu === item.key
@@ -403,6 +405,8 @@ export default function App() {
         return <Dashboard />;
       case MenuKey.VIDEO:
         return <VideoCenter />;
+      case MenuKey.VIDEO_PLAYBACK:
+        return <VideoPlayback />;
       case MenuKey.FENCE:
         return <FenceManagement />;
       case MenuKey.PROJECT:

@@ -16,6 +16,7 @@ from app.schemas.video_schema import (
     CruiseStartRequest,
     PresetBulkDeleteRequest,
     PresetBulkDeleteResponse,
+    StreamUrlResponse,
 )
 from app.models.video import VideoDevice
 from app.services.video_service import VideoService
@@ -31,10 +32,15 @@ router = APIRouter(prefix="/video", tags=["Video Surveillance"])
 service = VideoService()
 
 
+def _ensure_zoom_direction(direction: str):
+    if direction not in {"zoom_in", "zoom_out"}:
+        raise HTTPException(status_code=400, detail="变焦方向仅支持 zoom_in 或 zoom_out")
+
+
 # --- 放在 router 定义之前或之后都可以，只要在下面的接口用到它之前 ---
 class AIMonitorRequest(BaseModel):
     device_id: str
-    rtsp_url: str
+    rtsp_url: str | None = None
     algo_type: str = "helmet"
 
 
@@ -42,15 +48,37 @@ class PlaybackSaveRequest(BaseModel):
     start_time: str
     end_time: str
 
+
+class TempCacheTriggerRequest(BaseModel):
+    force: bool = True
+
 @router.post("/ai/start")
-async def start_ai(req: AIMonitorRequest):
+async def start_ai(req: AIMonitorRequest, db: Session = Depends(get_db)):
     """开启 AI 监控"""
-    # --- 2. 传参给 manager ---
-    success = ai_manager.start_monitoring(req.device_id, req.rtsp_url, req.algo_type)
+    device_id = str(req.device_id or "").strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id 不能为空")
+
+    db_video = None
+    rtsp_url = (req.rtsp_url or "").strip()
+    if device_id.isdigit():
+        db_video = db.query(VideoDevice).filter(VideoDevice.id == int(device_id)).first()
+        if not rtsp_url and db_video:
+            candidate = str(getattr(db_video, "rtsp_url", "") or getattr(db_video, "stream_url", "") or "").strip()
+            if candidate.lower().startswith("rtsp://"):
+                rtsp_url = candidate
+
+    has_valid_rtsp = rtsp_url.lower().startswith("rtsp://")
+    is_ezviz_cloud = bool(db_video and getattr(db_video, "device_serial", None))
+    if (not has_valid_rtsp) and (not is_ezviz_cloud):
+        raise HTTPException(status_code=400, detail="缺少有效 RTSP，且当前设备非萤石云设备，无法启动AI检测")
+
+    algo_type = str(req.algo_type or "").strip() or "helmet"
+    success = ai_manager.start_monitoring(device_id, rtsp_url if has_valid_rtsp else "", algo_type)
     if success:
-        return {"code": 200, "message": f"AI监控已启动: {req.algo_type}"}
+        return {"code": 200, "message": f"AI监控已启动: {algo_type}"}
     else:
-        return {"code": 400, "message": "启动失败或已在运行"}
+        raise HTTPException(status_code=400, detail="启动失败或已在运行")
 
 @router.get("/ai/rules")
 def get_ai_rules():
@@ -148,13 +176,27 @@ def sync_devices(db: Session = Depends(get_db)):
     service.sync_hikvision_devices(db)
     return {"message": "Sync started"}
 
-@router.get("/stream/{video_id}")
+
+@router.get("/ezviz/health")
+def get_ezviz_health():
+    """萤石云配置与 token 健康检查"""
+    return service.get_ezviz_health()
+
+@router.get("/stream/{video_id}", response_model=StreamUrlResponse)
 def get_video_stream(video_id: int, db: Session = Depends(get_db)):
     """获取指定设备的流媒体地址"""
-    url = service.get_stream_url(db, video_id)
-    if not url:
-        raise HTTPException(status_code=404, detail="Stream URL not found or device offline")
-    return {"url": url}
+    try:
+        info = service.get_stream_info(db, video_id)
+        if not info or not info.get("url"):
+            raise HTTPException(status_code=404, detail="Stream URL not found or device offline")
+        return info
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # 透传 service 层语义码前缀，前端可直接展示/分流处理。
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"UPSTREAM_ERROR: 获取播放地址失败: {e}")
 
 
 @router.post("/{video_id}/playback/save")
@@ -166,6 +208,53 @@ def save_playback_clip(video_id: int, body: PlaybackSaveRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"回放保存失败: {e}")
+
+
+@router.get("/{video_id}/recordings")
+def list_recording_segments(video_id: int, limit: int = 72):
+    """获取设备录像分段列表（默认最近72段）"""
+    try:
+        return service.list_recording_segments(video_id, limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取录像分段失败: {e}")
+
+
+@router.post("/{video_id}/playback/temp-cache")
+def save_temp_cache_clip(video_id: int, body: TempCacheTriggerRequest):
+    """触发从上一个归档时间节点到当前时刻的临时回放缓存"""
+    try:
+        return service.save_temp_cache_until_now(video_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"临时缓存生成失败: {e}")
+
+
+@router.get("/{video_id}/playback/videos")
+def list_saved_playback_videos(video_id: int, limit: int = 120):
+    """获取已保存的常态回放视频列表"""
+    try:
+        return service.list_saved_playback_videos(video_id, limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取常态回放列表失败: {e}")
+
+
+@router.get("/{video_id}/playback/temp/videos")
+def list_temp_cache_videos(video_id: int, limit: int = 30):
+    """获取临时缓存回放视频列表"""
+    try:
+        return service.list_temp_cache_videos(video_id, limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取临时回放列表失败: {e}")
+
+
+@router.get("/{video_id}/alarm/videos")
+def list_saved_alarm_videos(video_id: int, limit: int = 120):
+    """获取报警回放视频列表"""
+    try:
+        return service.list_saved_alarm_videos(video_id, limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取报警回放列表失败: {e}")
 
 
 @router.post("/time/sync/{video_id}")
@@ -262,6 +351,50 @@ def ptz_stop(video_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"PTZ 停止失败: {e}")
 
 
+@router.post("/zoom/{video_id}")
+def zoom_control(video_id: int, body: PTZControlRequest, db: Session = Depends(get_db)):
+    """变焦单次控制接口"""
+    try:
+        direction = body.direction.value
+        _ensure_zoom_direction(direction)
+        service.zoom_move(db, video_id, direction, body.speed or 0.5, body.duration or 0.5)
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"变焦控制失败: {e}")
+
+
+@router.post("/zoom/{video_id}/start")
+def zoom_start(video_id: int, body: PTZControlRequest, db: Session = Depends(get_db)):
+    """变焦持续控制开始（按下开始）"""
+    try:
+        direction = body.direction.value
+        _ensure_zoom_direction(direction)
+        service.zoom_start_move(db, video_id, direction, body.speed or 0.5)
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"变焦启动失败: {e}")
+
+
+@router.post("/zoom/{video_id}/stop")
+def zoom_stop(video_id: int, db: Session = Depends(get_db)):
+    """变焦持续控制停止（松开停止）"""
+    try:
+        service.zoom_stop_move(db, video_id)
+        return {"status": "ok"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"变焦停止失败: {e}")
+
+
 @router.get("/ptz/{video_id}/presets", response_model=list[PTZPresetItem])
 def get_presets(video_id: int, db: Session = Depends(get_db)):
     """获取摄像头预置点列表"""
@@ -353,4 +486,5 @@ async def stop_ai(device_id: str):
     if success:
         return {"code": 200, "message": "AI监控已停止"}
     else:
-        return {"code": 400, "message": "停止失败或未运行"}
+        # 幂等语义：未运行也返回成功，便于前端先 stop 再 start。
+        return {"code": 200, "message": "AI监控未运行，已跳过停止"}

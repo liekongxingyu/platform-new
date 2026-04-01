@@ -15,7 +15,6 @@ import {
   LayoutGrid,
   Loader,
   Settings,
-  Save,
   Edit2,
   // --- ✅ 新增图标（已合并，无重复）---
   Shield,
@@ -27,6 +26,7 @@ import VideoPlayer from "../src/components/VideoPlayer";
 import PTZControlPanel from "../src/components/PTZControlPanel";
 import {
   getAllVideos,
+  createVideo,
   deleteVideo,
   getVideoStreamUrl,
   addCameraViaRTSP,
@@ -39,8 +39,8 @@ import {
   startAIMonitoring,
   stopAIMonitoring,
   getAIRules,
-  savePlaybackClip,
   AIRule,
+  StreamUrl,
 } from "../src/api/videoApi";
 import { API_BASE_URL } from "../src/api/config";
 
@@ -215,6 +215,7 @@ export default function VideoCenter() {
   const [searchTerm, setSearchTerm] = useState("");
   const [maximizedVideo, setMaximizedVideo] = useState<Video | null>(null);
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
+  const [streamInfo, setStreamInfo] = useState<StreamUrl | null>(null);
   
   // --- ✅ 新增 AI 监控状态 ---
   const [isAIEnabled, setIsAIEnabled] = useState(false);
@@ -233,7 +234,7 @@ export default function VideoCenter() {
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage, setItemsPerPage] = useState(9);
   const [gridInputValue, setGridInputValue] = useState("9");
-  const [previewStreams, setPreviewStreams] = useState<Record<number, string>>({});
+  const [previewStreams, setPreviewStreams] = useState<Record<number, StreamUrl>>({});
   const [previewLoading, setPreviewLoading] = useState<Record<number, boolean>>({});
   const [previewErrors, setPreviewErrors] = useState<Record<number, string>>({});
   const [workDurationByDevice, setWorkDurationByDevice] = useState<Record<number, number>>(loadWorkDurationMap);
@@ -243,10 +244,6 @@ export default function VideoCenter() {
   const [showEditModal, setShowEditModal] = useState(false);
   const [selectedDevice, setSelectedDevice] = useState<Video | null>(null);
   const [editingDevice, setEditingDevice] = useState<Video | null>(null);
-  const [playbackStartTime, setPlaybackStartTime] = useState("");
-  const [playbackEndTime, setPlaybackEndTime] = useState("");
-  const [playbackSaving, setPlaybackSaving] = useState(false);
-  const [playbackSavedPath, setPlaybackSavedPath] = useState<string | null>(null);
   const alarmWsRef = useRef<WebSocket | null>(null);
   const alarmReconnectTimerRef = useRef<number | null>(null);
   const alarmCloseTimerRef = useRef<number | null>(null);
@@ -260,6 +257,12 @@ export default function VideoCenter() {
     username: "",
     password: "",
     stream_url: "",
+    stream_protocol: "flv",
+    platform_type: "onvif",
+    access_source: "local",
+    ptz_source: "onvif",
+    device_serial: "",
+    channel_no: 1,
     status: "offline",
     remark: "",
   });
@@ -271,6 +274,12 @@ export default function VideoCenter() {
     username: "",
     password: "",
     stream_url: "",
+    stream_protocol: "flv",
+    platform_type: "onvif",
+    access_source: "local",
+    ptz_source: "onvif",
+    device_serial: "",
+    channel_no: 1,
     status: "offline",
     remark: "",
   });
@@ -356,29 +365,6 @@ export default function VideoCenter() {
     setIsAIEnabled(false);
   }, [maximizedVideo]);
 
-  useEffect(() => {
-    if (!maximizedVideo) {
-      setPlaybackSavedPath(null);
-      return;
-    }
-
-    const toInputValue = (d: Date) => {
-      const pad = (v: number) => String(v).padStart(2, "0");
-      const year = d.getFullYear();
-      const month = pad(d.getMonth() + 1);
-      const day = pad(d.getDate());
-      const hour = pad(d.getHours());
-      const minute = pad(d.getMinutes());
-      return `${year}-${month}-${day}T${hour}:${minute}`;
-    };
-
-    const now = new Date();
-    const tenMinutesAgo = new Date(now.getTime() - 10 * 60 * 1000);
-    setPlaybackStartTime(toInputValue(tenMinutesAgo));
-    setPlaybackEndTime(toInputValue(now));
-    setPlaybackSavedPath(null);
-  }, [maximizedVideo]);
-
   // --- ✅ 改进：AI 开关处理逻辑 ---
 
   // 1. 处理单个功能的开启/关闭
@@ -388,10 +374,14 @@ export default function VideoCenter() {
 
   try {
     const deviceId = String(maximizedVideo.id);
-    const rtsp = maximizedVideo.rtsp_url || "";
+    const rtsp = (maximizedVideo.rtsp_url || maximizedVideo.stream_url || "").trim();
+    const isEzvizCloud =
+      String(maximizedVideo.platform_type || "").toLowerCase() === "ezviz" ||
+      String(maximizedVideo.access_source || "").toLowerCase() === "cloud" ||
+      !!maximizedVideo.device_serial;
 
-    if (!rtsp || !rtsp.toLowerCase().startsWith("rtsp://")) {
-      alert("当前设备缺少有效 RTSP 地址，请先编辑设备并填写 RTSP 流地址");
+    if ((!rtsp || !rtsp.toLowerCase().startsWith("rtsp://")) && !isEzvizCloud) {
+      alert("当前设备缺少有效 RTSP 地址（本地设备必填）");
       return;
     }
 
@@ -402,10 +392,11 @@ export default function VideoCenter() {
     // ✅ 关键：不要循环 start 多次；后端按 device_id 只允许一个监控线程
     await stopAIMonitoring(deviceId);
     if (nextAlgos.length > 0) {
-      await startAIMonitoring(deviceId, rtsp, nextAlgos.join(","));
+      await startAIMonitoring(deviceId, isEzvizCloud ? "" : rtsp, nextAlgos.join(","));
     }
 
     setActiveAlgos(nextAlgos);
+    setIsAIEnabled(nextAlgos.length > 0);
   } catch (error) {
     console.error(`${type} 操作失败:`, error);
     alert("AI 服务同步失败");
@@ -422,10 +413,14 @@ export default function VideoCenter() {
 
   try {
     const deviceId = String(maximizedVideo.id);
-    const rtsp = maximizedVideo.rtsp_url || "";
+    const rtsp = (maximizedVideo.rtsp_url || maximizedVideo.stream_url || "").trim();
+    const isEzvizCloud =
+      String(maximizedVideo.platform_type || "").toLowerCase() === "ezviz" ||
+      String(maximizedVideo.access_source || "").toLowerCase() === "cloud" ||
+      !!maximizedVideo.device_serial;
 
-    if (!rtsp || !rtsp.toLowerCase().startsWith("rtsp://")) {
-      alert("当前设备缺少有效 RTSP 地址，请先编辑设备并填写 RTSP 流地址");
+    if ((!rtsp || !rtsp.toLowerCase().startsWith("rtsp://")) && !isEzvizCloud) {
+      alert("当前设备缺少有效 RTSP 地址（本地设备必填）");
       return;
     }
 
@@ -433,13 +428,16 @@ export default function VideoCenter() {
 
     if (enable) {
       const all = algos.map(a => a.id);
-      await startAIMonitoring(deviceId, rtsp, all.join(","));
+      await startAIMonitoring(deviceId, isEzvizCloud ? "" : rtsp, all.join(","));
       setActiveAlgos(all);
+      setIsAIEnabled(true);
     } else {
       setActiveAlgos([]);
+      setIsAIEnabled(false);
     }
   } catch (error) {
-    alert("批量操作失败");
+    const msg = (error as any)?.message || "批量操作失败";
+    alert(msg);
   } finally {
     setAiLoading(false);
   }
@@ -569,6 +567,26 @@ export default function VideoCenter() {
   };
 
   useEffect(() => {
+    if (!isAIEnabled) {
+      if (alarmReconnectTimerRef.current) {
+        window.clearTimeout(alarmReconnectTimerRef.current);
+        alarmReconnectTimerRef.current = null;
+      }
+      if (alarmCloseTimerRef.current) {
+        window.clearTimeout(alarmCloseTimerRef.current);
+        alarmCloseTimerRef.current = null;
+      }
+      if (alarmBoxesClearTimerRef.current) {
+        window.clearTimeout(alarmBoxesClearTimerRef.current);
+        alarmBoxesClearTimerRef.current = null;
+      }
+      if (alarmWsRef.current) {
+        alarmWsRef.current.close();
+        alarmWsRef.current = null;
+      }
+      return;
+    }
+
     const wsUrl = getAlarmWebSocketUrl();
     let disposed = false;
 
@@ -676,7 +694,7 @@ export default function VideoCenter() {
         alarmWsRef.current = null;
       }
     };
-  }, []);
+  }, [isAIEnabled, maximizedVideo?.id]);
 
   const formatLocalDateTimeForApi = (date: Date) => {
     const pad = (v: number) => String(v).padStart(2, "0");
@@ -716,13 +734,11 @@ export default function VideoCenter() {
 
   const handleShowStream = async (device: Video) => {
     try {
-      let url = previewStreams[device.id];
-      if (!url) {
-        const data = await getVideoStreamUrl(device.id);
-        url = data.url;
-        setPreviewStreams((prev) => ({ ...prev, [device.id]: url }));
-      }
-      setStreamUrl(url);
+      // 全屏播放时总是拉取最新地址，避免设备配置切换后复用旧缓存。
+      const info = await getVideoStreamUrl(device.id);
+      setPreviewStreams((prev) => ({ ...prev, [device.id]: info }));
+      setStreamInfo(info);
+      setStreamUrl(info.url);
       setMaximizedVideo(device);
     } catch (err: any) {
       alert(`获取视频流失败: ${err.message}`);
@@ -731,13 +747,16 @@ export default function VideoCenter() {
 
   const loadPreviewStream = useCallback(
     async (device: Video) => {
+      if (maximizedVideo?.id === device.id) {
+        return;
+      }
       if (!device || previewStreams[device.id] || previewLoading[device.id]) {
         return;
       }
       setPreviewLoading((prev) => ({ ...prev, [device.id]: true }));
       try {
         const data = await getVideoStreamUrl(device.id);
-        setPreviewStreams((prev) => ({ ...prev, [device.id]: data.url }));
+        setPreviewStreams((prev) => ({ ...prev, [device.id]: data }));
         setPreviewErrors((prev) => ({ ...prev, [device.id]: "" }));
       } catch (err: any) {
         setPreviewErrors((prev) => ({
@@ -748,16 +767,19 @@ export default function VideoCenter() {
         setPreviewLoading((prev) => ({ ...prev, [device.id]: false }));
       }
     },
-    [previewLoading, previewStreams]
+    [maximizedVideo?.id, previewLoading, previewStreams]
   );
 
   useEffect(() => {
+    if (maximizedVideo) {
+      return;
+    }
     currentVideos.forEach((device) => {
       if (device) {
         loadPreviewStream(device);
       }
     });
-  }, [currentVideos, loadPreviewStream]);
+  }, [currentVideos, loadPreviewStream, maximizedVideo]);
 
   const handleGridInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const value = e.target.value;
@@ -777,23 +799,47 @@ export default function VideoCenter() {
   };
 
   const handleAddDevice = async () => {
-    if (!newDeviceForm.name || !newDeviceForm.stream_url) {
-      alert("请填写必填字段：设备名称和流地址");
+    const isEzviz = (newDeviceForm.platform_type || "onvif") === "ezviz";
+    if (!newDeviceForm.name) {
+      alert("请填写必填字段：设备名称");
+      return;
+    }
+    if (!isEzviz && !newDeviceForm.stream_url) {
+      alert("本地设备请填写流地址");
+      return;
+    }
+    if (isEzviz && !newDeviceForm.device_serial) {
+      alert("萤石设备请填写设备序列号");
       return;
     }
 
-    const payload = {
+    const commonPayload = {
       name: newDeviceForm.name,
-      rtsp_url: newDeviceForm.stream_url,
       ip_address: newDeviceForm.ip_address || undefined,
       port: newDeviceForm.port,
       username: newDeviceForm.username,
       password: newDeviceForm.password,
       remark: newDeviceForm.remark,
+      stream_protocol: newDeviceForm.stream_protocol,
+      platform_type: newDeviceForm.platform_type,
+      access_source: isEzviz ? "cloud" : "local",
+      ptz_source: isEzviz ? "ezviz" : "onvif",
+      device_serial: newDeviceForm.device_serial || undefined,
+      channel_no: newDeviceForm.channel_no || 1,
     };
 
     try {
-      const newDevice = await addCameraViaRTSP(payload);
+      const newDevice = isEzviz
+        ? await createVideo({
+            ...commonPayload,
+            stream_url: "",
+            rtsp_url: undefined,
+            status: "online",
+          })
+        : await addCameraViaRTSP({
+            ...commonPayload,
+            rtsp_url: newDeviceForm.stream_url || "",
+          });
       setDevices([newDevice, ...devices]);
       setShowAddModal(false);
       setNewDeviceForm({
@@ -803,6 +849,12 @@ export default function VideoCenter() {
         username: "",
         password: "",
         stream_url: "",
+        stream_protocol: "flv",
+        platform_type: "onvif",
+        access_source: "local",
+        ptz_source: "onvif",
+        device_serial: "",
+        channel_no: 1,
         status: "offline",
         remark: "",
       });
@@ -818,11 +870,17 @@ export default function VideoCenter() {
     setEditingDevice(device);
     setEditDeviceForm({
       name: device.name,
-      ip_address: device.ip_address,
-      port: device.port,
+      ip_address: device.ip_address || "",
+      port: device.port || 80,
       username: device.username || "",
       password: device.password || "",
       stream_url: device.rtsp_url || "",
+      stream_protocol: device.stream_protocol || "flv",
+      platform_type: device.platform_type || "onvif",
+      access_source: device.access_source || "local",
+      ptz_source: device.ptz_source || "onvif",
+      device_serial: device.device_serial || "",
+      channel_no: device.channel_no || 1,
       status: device.status,
       remark: device.remark || "",
     });
@@ -831,20 +889,41 @@ export default function VideoCenter() {
 
   const handleUpdateDevice = async () => {
     if (!editingDevice) return;
-    if (!editDeviceForm.name || !editDeviceForm.stream_url) {
-      alert("请填写必填字段：设备名称和流地址");
+    const isEzviz = (editDeviceForm.platform_type || "onvif") === "ezviz";
+    if (!editDeviceForm.name) {
+      alert("请填写必填字段：设备名称");
+      return;
+    }
+    if (!isEzviz && !editDeviceForm.stream_url) {
+      alert("本地设备请填写流地址");
+      return;
+    }
+    if (isEzviz && !editDeviceForm.device_serial) {
+      alert("萤石设备请填写设备序列号");
       return;
     }
 
     try {
       const updatedDevice = await updateVideo(editingDevice.id, {
         ...editDeviceForm,
-        rtsp_url: editDeviceForm.stream_url,
+        access_source: isEzviz ? "cloud" : "local",
+        ptz_source: isEzviz ? "ezviz" : "onvif",
+        rtsp_url: isEzviz ? undefined : editDeviceForm.stream_url,
         stream_url: undefined,
       });
       setDevices(
         devices.map((d) => (d.id === editingDevice.id ? updatedDevice : d))
       );
+      setPreviewStreams((prev) => {
+        const next = { ...prev };
+        delete next[editingDevice.id];
+        return next;
+      });
+      setPreviewErrors((prev) => {
+        const next = { ...prev };
+        delete next[editingDevice.id];
+        return next;
+      });
       setShowEditModal(false);
       setEditingDevice(null);
     } catch (err: any) {
@@ -861,45 +940,6 @@ export default function VideoCenter() {
       } catch (err: any) {
         alert(`删除失败: ${err.message}`);
       }
-    }
-  };
-
-  const handleSavePlayback = async () => {
-    if (!maximizedVideo) {
-      alert("请先选择摄像头");
-      return;
-    }
-
-    if (!playbackStartTime || !playbackEndTime) {
-      alert("请先选择开始和结束时间");
-      return;
-    }
-
-    const startDate = new Date(playbackStartTime);
-    const endDate = new Date(playbackEndTime);
-
-    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
-      alert("时间格式无效");
-      return;
-    }
-
-    if (endDate <= startDate) {
-      alert("结束时间必须大于开始时间");
-      return;
-    }
-
-    try {
-      setPlaybackSaving(true);
-      const resp = await savePlaybackClip(maximizedVideo.id, {
-        start_time: formatLocalDateTimeForApi(startDate),
-        end_time: formatLocalDateTimeForApi(endDate),
-      });
-      setPlaybackSavedPath(resp.recording_path);
-      alert("回放保存成功");
-    } catch (e: any) {
-      alert(`回放保存失败: ${e?.message || "未知错误"}`);
-    } finally {
-      setPlaybackSaving(false);
     }
   };
 
@@ -1183,10 +1223,16 @@ export default function VideoCenter() {
                       onDoubleClick={() => handleVideoDoubleClick(device)}
                     >
                       <div className="absolute inset-0">
-                        {previewStreams[device.id] ? (
+                        {maximizedVideo?.id === device.id ? (
+                          <div className="h-full w-full flex items-center justify-center text-cyan-200 text-xs bg-slate-950/70">
+                            当前设备正在全屏播放，已暂停预览拉流
+                          </div>
+                        ) : previewStreams[device.id] ? (
                           <VideoPlayer
-                            key={previewStreams[device.id]}
-                            src={previewStreams[device.id]}
+                            key={previewStreams[device.id].url}
+                            src={previewStreams[device.id].url}
+                            playType={previewStreams[device.id].play_type}
+                            accessToken={previewStreams[device.id].access_token}
                           />
                         ) : previewLoading[device.id] ? (
                           <div className="h-full w-full flex items-center justify-center text-slate-300 text-sm">
@@ -1229,6 +1275,12 @@ export default function VideoCenter() {
                       />
                       <span className="text-xs bg-slate-900/75 backdrop-blur px-2 py-0.5 rounded text-slate-100 border border-cyan-300/20 shadow-sm">
                         {device.name}
+                      </span>
+                      <span className="text-[10px] bg-slate-900/80 px-1.5 py-0.5 rounded border border-blue-300/20 text-cyan-200 uppercase">
+                        {device.platform_type || "onvif"}
+                      </span>
+                      <span className="text-[10px] bg-slate-900/80 px-1.5 py-0.5 rounded border border-blue-300/20 text-sky-200 uppercase">
+                        {device.stream_protocol || "flv"}
                       </span>
                     </div>
                     {/* 悬浮操作栏 */}
@@ -1368,6 +1420,68 @@ export default function VideoCenter() {
                 />
               </div>
               <div className="col-span-2">
+                <label className="text-xs font-semibold text-slate-300 block mb-1">平台类型</label>
+                <select
+                  className="w-full bg-slate-950/60 border border-blue-300/30 rounded p-2 text-sm focus:border-cyan-300 focus:ring-2 focus:ring-cyan-400/30 outline-none text-slate-100"
+                  value={newDeviceForm.platform_type || "onvif"}
+                  onChange={(e) => {
+                    const platform = e.target.value as "onvif" | "ezviz";
+                    setNewDeviceForm({
+                      ...newDeviceForm,
+                      platform_type: platform,
+                      access_source: platform === "ezviz" ? "cloud" : "local",
+                      ptz_source: platform === "ezviz" ? "ezviz" : "onvif",
+                      stream_protocol: platform === "ezviz" ? "ezopen" : (newDeviceForm.stream_protocol || "flv"),
+                    });
+                  }}
+                >
+                  <option value="onvif">本地 ONVIF/RTSP</option>
+                  <option value="ezviz">萤石云设备</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1">设备序列号</label>
+                <input
+                  className="w-full bg-slate-950/60 border border-blue-300/30 rounded p-2 text-sm focus:border-cyan-300 focus:ring-2 focus:ring-cyan-400/30 outline-none text-slate-100"
+                  value={newDeviceForm.device_serial || ""}
+                  onChange={(e) =>
+                    setNewDeviceForm({ ...newDeviceForm, device_serial: e.target.value })
+                  }
+                  placeholder="例如：GM7974925"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1">通道号</label>
+                <input
+                  type="number"
+                  min={1}
+                  className="w-full bg-slate-950/60 border border-blue-300/30 rounded p-2 text-sm focus:border-cyan-300 focus:ring-2 focus:ring-cyan-400/30 outline-none text-slate-100"
+                  value={newDeviceForm.channel_no || 1}
+                  onChange={(e) =>
+                    setNewDeviceForm({ ...newDeviceForm, channel_no: parseInt(e.target.value, 10) || 1 })
+                  }
+                  placeholder="1"
+                />
+              </div>
+              <div className="col-span-2">
+                <label className="text-xs font-semibold text-slate-300 block mb-1">播放协议偏好</label>
+                <select
+                  className="w-full bg-slate-950/60 border border-blue-300/30 rounded p-2 text-sm focus:border-cyan-300 focus:ring-2 focus:ring-cyan-400/30 outline-none text-slate-100"
+                  value={newDeviceForm.stream_protocol || "flv"}
+                  onChange={(e) =>
+                    setNewDeviceForm({
+                      ...newDeviceForm,
+                      stream_protocol: e.target.value as "ezopen" | "hls" | "rtmp" | "flv",
+                    })
+                  }
+                >
+                  <option value="ezopen">EZOPEN</option>
+                  <option value="flv">FLV</option>
+                  <option value="hls">HLS</option>
+                  <option value="rtmp">RTMP</option>
+                </select>
+              </div>
+              <div className="col-span-2">
                 <label className="text-xs font-semibold text-gray-700 block mb-1">
                   流地址（RTSP/HLS）
                 </label>
@@ -1377,7 +1491,7 @@ export default function VideoCenter() {
                   onChange={(e) =>
                     setNewDeviceForm({ ...newDeviceForm, stream_url: e.target.value })
                   }
-                  placeholder="示例：rtsp://账号:密码@192.168.1.100:554/..."
+                  placeholder={newDeviceForm.platform_type === "ezviz" ? "萤石设备可留空" : "示例：rtsp://账号:密码@192.168.1.100:554/..."}
                 />
               </div>
               <div className="col-span-2">
@@ -1487,6 +1601,68 @@ export default function VideoCenter() {
                 />
               </div>
               <div className="col-span-2">
+                <label className="text-xs font-semibold text-slate-300 block mb-1">平台类型</label>
+                <select
+                  className="w-full bg-slate-950/60 border border-blue-300/30 rounded p-2 text-sm focus:border-cyan-300 focus:ring-2 focus:ring-cyan-400/30 outline-none text-slate-100"
+                  value={editDeviceForm.platform_type || "onvif"}
+                  onChange={(e) => {
+                    const platform = e.target.value as "onvif" | "ezviz";
+                    setEditDeviceForm({
+                      ...editDeviceForm,
+                      platform_type: platform,
+                      access_source: platform === "ezviz" ? "cloud" : "local",
+                      ptz_source: platform === "ezviz" ? "ezviz" : "onvif",
+                      stream_protocol: platform === "ezviz" ? "ezopen" : (editDeviceForm.stream_protocol || "flv"),
+                    });
+                  }}
+                >
+                  <option value="onvif">本地 ONVIF/RTSP</option>
+                  <option value="ezviz">萤石云设备</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1">设备序列号</label>
+                <input
+                  className="w-full bg-slate-950/60 border border-blue-300/30 rounded p-2 text-sm focus:border-cyan-300 focus:ring-2 focus:ring-cyan-400/30 outline-none text-slate-100"
+                  value={editDeviceForm.device_serial || ""}
+                  onChange={(e) =>
+                    setEditDeviceForm({ ...editDeviceForm, device_serial: e.target.value })
+                  }
+                  placeholder="例如：GM7974925"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1">通道号</label>
+                <input
+                  type="number"
+                  min={1}
+                  className="w-full bg-slate-950/60 border border-blue-300/30 rounded p-2 text-sm focus:border-cyan-300 focus:ring-2 focus:ring-cyan-400/30 outline-none text-slate-100"
+                  value={editDeviceForm.channel_no || 1}
+                  onChange={(e) =>
+                    setEditDeviceForm({ ...editDeviceForm, channel_no: parseInt(e.target.value, 10) || 1 })
+                  }
+                  placeholder="1"
+                />
+              </div>
+              <div className="col-span-2">
+                <label className="text-xs font-semibold text-slate-300 block mb-1">播放协议偏好</label>
+                <select
+                  className="w-full bg-slate-950/60 border border-blue-300/30 rounded p-2 text-sm focus:border-cyan-300 focus:ring-2 focus:ring-cyan-400/30 outline-none text-slate-100"
+                  value={editDeviceForm.stream_protocol || "flv"}
+                  onChange={(e) =>
+                    setEditDeviceForm({
+                      ...editDeviceForm,
+                      stream_protocol: e.target.value as "ezopen" | "hls" | "rtmp" | "flv",
+                    })
+                  }
+                >
+                  <option value="ezopen">EZOPEN</option>
+                  <option value="flv">FLV</option>
+                  <option value="hls">HLS</option>
+                  <option value="rtmp">RTMP</option>
+                </select>
+              </div>
+              <div className="col-span-2">
                 <label className="text-xs font-semibold text-gray-700 block mb-1">
                   流地址（RTSP/HLS）
                 </label>
@@ -1496,7 +1672,7 @@ export default function VideoCenter() {
                   onChange={(e) =>
                     setEditDeviceForm({ ...editDeviceForm, stream_url: e.target.value })
                   }
-                  placeholder="示例：rtsp://账号:密码@192.168.1.100:554/..."
+                  placeholder={editDeviceForm.platform_type === "ezviz" ? "萤石设备可留空" : "示例：rtsp://账号:密码@192.168.1.100:554/..."}
                 />
               </div>
               <div className="col-span-2">
@@ -1544,6 +1720,7 @@ export default function VideoCenter() {
               onClick={() => {
                 setMaximizedVideo(null);
                 setStreamUrl(null);
+                setStreamInfo(null);
               }}
               className="p-2 text-slate-400 hover:bg-rose-500/20 hover:text-rose-300 rounded-full transition-colors"
             >
@@ -1561,19 +1738,22 @@ export default function VideoCenter() {
                     <div className="flex items-center gap-2 font-semibold">
                       <MonitorPlay size={18} /> 流信息
                     </div>
+                    <div className="mt-2 text-xs text-cyan-200/90">
+                      协议: {streamInfo?.play_type || "unknown"} | 平台: {streamInfo?.platform || "unknown"}
+                    </div>
                     <code className="mt-2 block text-xs bg-slate-950/70 p-2 rounded border border-blue-300/25 break-all text-slate-200 max-h-20 overflow-auto vc-scrollbar">
                       {streamUrl}
                     </code>
                   </div>
                   <div className="flex-1 flex items-center justify-center bg-black relative min-h-0">
                     <div className="relative w-full h-full">
-                      <VideoPlayer src={streamUrl} />
+                      <VideoPlayer src={streamUrl} playType={streamInfo?.play_type} accessToken={streamInfo?.access_token} />
                       <canvas
                       id="aiCanvas"
                       ref={aiCanvasRef}
                       className="absolute top-0 left-0 w-full h-full pointer-events-none"
                     />
-                      <div className="absolute top-14 left-16 z-20 pointer-events-none flex flex-col gap-0.5 max-w-[45vw] text-black text-lg font-bold leading-7 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)]">
+                      <div className="absolute top-24 left-16 z-20 pointer-events-none flex flex-col gap-0.5 max-w-[45vw] text-black text-lg font-bold leading-7 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)]">
                         <div className="truncate">{maximizedVideo.name || ""}</div>
                         <div className="truncate">{maximizedVideo.remark?.trim() || ""}</div>
                         <div className="truncate">累计工作时长：{formatWorkDuration(currentWorkDurationSeconds)}</div>
@@ -1666,51 +1846,6 @@ export default function VideoCenter() {
                     onSuccess={handlePtzSuccess}
                     onError={handlePtzError}
                   />
-                </div>
-
-                {/* 回放保存 */}
-                <div className="bg-slate-900/75 rounded-lg border border-blue-300/25 p-4 shadow-lg shrink-0">
-                  <div className="flex items-center gap-2 mb-3 text-slate-100 font-semibold">
-                    <Save size={16} className="text-cyan-300" />
-                    回放保存
-                  </div>
-
-                  <div className="space-y-3">
-                    <div>
-                      <label className="text-xs text-slate-300 block mb-1">开始时间</label>
-                      <input
-                        type="datetime-local"
-                        value={playbackStartTime}
-                        onChange={(e) => setPlaybackStartTime(e.target.value)}
-                        className="w-full bg-slate-950/65 border border-blue-300/25 rounded p-2 text-sm text-slate-200 outline-none focus:ring-2 focus:ring-cyan-400/30"
-                      />
-                    </div>
-
-                    <div>
-                      <label className="text-xs text-slate-300 block mb-1">结束时间</label>
-                      <input
-                        type="datetime-local"
-                        value={playbackEndTime}
-                        onChange={(e) => setPlaybackEndTime(e.target.value)}
-                        className="w-full bg-slate-950/65 border border-blue-300/25 rounded p-2 text-sm text-slate-200 outline-none focus:ring-2 focus:ring-cyan-400/30"
-                      />
-                    </div>
-
-                    <button
-                      onClick={handleSavePlayback}
-                      disabled={playbackSaving}
-                      className="w-full py-2 rounded bg-cyan-500 hover:bg-cyan-400 disabled:opacity-60 text-slate-900 text-sm font-bold transition-colors flex items-center justify-center gap-2"
-                    >
-                      {playbackSaving ? <Loader size={14} className="animate-spin" /> : <Save size={14} />}
-                      {playbackSaving ? "保存中..." : "保存当前回放时段"}
-                    </button>
-
-                    {playbackSavedPath && (
-                      <div className="text-[11px] text-emerald-200 break-all bg-emerald-500/10 border border-emerald-400/20 rounded p-2">
-                        已保存: {playbackSavedPath}
-                      </div>
-                    )}
-                  </div>
                 </div>
               </div>
             )}

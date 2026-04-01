@@ -6,12 +6,23 @@ import { API_BASE_URL } from './config';
 export interface Video {
   id: number;
   name: string;
-  ip_address: string;
-  port: number;
+  ip_address?: string;
+  port?: number;
   username?: string; // 补全：用于编辑回显
   password?: string; // 补全：用于编辑回显
   stream_url?: string; // 后端可能返回 null
   rtsp_url?: string;
+  stream_protocol?: 'ezopen' | 'hls' | 'rtmp' | 'flv';
+  platform_type?: 'onvif' | 'ezviz' | string;
+  access_source?: 'local' | 'cloud' | string;
+  ptz_source?: 'onvif' | 'ezviz' | string;
+  device_serial?: string;
+  channel_no?: number;
+  supports_ptz?: number;
+  supports_preset?: number;
+  supports_cruise?: number;
+  supports_zoom?: number;
+  supports_focus?: number;
   status: 'online' | 'offline';
   is_active: number;
   remark?: string;
@@ -22,12 +33,18 @@ export interface Video {
 // 对应后端的 VideoCreate schema (创建时提交的数据)
 export interface VideoCreate {
   name: string;
-  ip_address: string;
+  ip_address?: string;
   port?: number;      // 后端默认为 80
   username?: string;
   password?: string;
   stream_url?: string; // 改为可选，允许为空
   rtsp_url?: string;
+  stream_protocol?: 'ezopen' | 'hls' | 'rtmp' | 'flv';
+  platform_type?: 'onvif' | 'ezviz' | string;
+  access_source?: 'local' | 'cloud' | string;
+  ptz_source?: 'onvif' | 'ezviz' | string;
+  device_serial?: string;
+  channel_no?: number;
   status?: 'online' | 'offline';
   remark?: string;
 }
@@ -41,6 +58,17 @@ export interface VideoUpdate {
   password?: string;
   stream_url?: string;
   rtsp_url?: string;
+  stream_protocol?: 'ezopen' | 'hls' | 'rtmp' | 'flv';
+  platform_type?: 'onvif' | 'ezviz' | string;
+  access_source?: 'local' | 'cloud' | string;
+  ptz_source?: 'onvif' | 'ezviz' | string;
+  device_serial?: string;
+  channel_no?: number;
+  supports_ptz?: number;
+  supports_preset?: number;
+  supports_cruise?: number;
+  supports_zoom?: number;
+  supports_focus?: number;
   status?: 'online' | 'offline';
   remark?: string;
   is_active?: number;
@@ -48,6 +76,11 @@ export interface VideoUpdate {
 
 export interface StreamUrl {
   url: string;
+  play_type: 'ezopen' | 'hls' | 'rtmp' | 'flv' | 'rtsp' | string;
+  platform: 'ezviz' | 'onvif' | string;
+  device_serial?: string;
+  channel_no?: number;
+  access_token?: string;
 }
 
 export interface AIRule {
@@ -69,7 +102,30 @@ export interface PlaybackSaveResponse {
   recording_path: string;
 }
 
+export interface RecordingSegment {
+  name: string;
+  start_time: string;
+  end_time: string;
+  duration_seconds: number;
+  size_bytes: number;
+  web_path: string;
+}
+
+export interface SavedPlaybackVideo {
+  name: string;
+  size_bytes: number;
+  updated_at: string;
+  web_path: string;
+}
+
+export interface TempCacheSaveResponse extends PlaybackSaveResponse {
+  cache_window_start: string;
+  cache_window_end: string;
+  archive_window_hours: number;
+}
+
 export type PTZDirection = 'up' | 'down' | 'left' | 'right' | 'zoom_in' | 'zoom_out';
+export type ZoomDirection = 'zoom_in' | 'zoom_out';
 
 export interface PTZPresetItem {
   token: string;
@@ -163,14 +219,62 @@ export async function deleteVideo(videoId: number): Promise<{ status: string }> 
   return response.json();
 }
 
-/** 获取指定设备的视频流地址 */
+// --- 前端流媒体地址缓存机制 ---
+// 防止短时间内重复请求导致萤石云并发数超限
+
+interface CacheEntry<T> {
+  data: T;
+  timestamp: number;
+  expiresIn: number; // 缓存有效期（毫秒）
+}
+
+const STREAM_URL_FRONTEND_CACHE: Map<number, CacheEntry<StreamUrl>> = new Map();
+const STREAM_URL_REQUEST_LOCKS: Map<number, Promise<StreamUrl>> = new Map();
+
+/** 获取指定设备的视频流地址（带前端缓存） */
 export async function getVideoStreamUrl(videoId: number): Promise<StreamUrl> {
-  const response = await fetch(`${API_BASE_URL}/video/stream/${videoId}`);
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.detail || 'Failed to get stream URL');
+  const now = Date.now();
+  
+  // 1. 检查前端缓存是否有效
+  const cached = STREAM_URL_FRONTEND_CACHE.get(videoId);
+  if (cached && cached.timestamp + cached.expiresIn > now) {
+    console.log(`[缓存命中] 视频流地址 video_id=${videoId}`);
+    return cached.data;
   }
-  return response.json();
+  
+  // 2. 如果有进行中的请求，返回该 Promise，避免并发重复请求
+  if (STREAM_URL_REQUEST_LOCKS.has(videoId)) {
+    console.log(`[请求中] 等待视频流请求完成 video_id=${videoId}`);
+    return STREAM_URL_REQUEST_LOCKS.get(videoId)!;
+  }
+  
+  // 3. 发起新请求并使用锁防止并发
+  const requestPromise = (async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/video/stream/${videoId}`);
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.detail || 'Failed to get stream URL');
+      }
+      const data = await response.json();
+      
+      // 4. 缓存结果（缓存 55 分钟，比后端的 3300 秒短一点）
+      STREAM_URL_FRONTEND_CACHE.set(videoId, {
+        data,
+        timestamp: now,
+        expiresIn: 55 * 60 * 1000,
+      });
+      
+      console.log(`[缓存保存] 视频流地址已缓存 video_id=${videoId}, 有效期=3300秒`);
+      return data;
+    } finally {
+      // 5. 移除锁，允许后续请求
+      STREAM_URL_REQUEST_LOCKS.delete(videoId);
+    }
+  })();
+  
+  STREAM_URL_REQUEST_LOCKS.set(videoId, requestPromise);
+  return requestPromise;
 }
 
 /** 同步设备列表 (补充缺失的方法) */
@@ -196,6 +300,12 @@ export async function addCameraViaRTSP(cameraData: {
   latitude?: number;
   longitude?: number;
   remark?: string;
+  stream_protocol?: 'ezopen' | 'hls' | 'rtmp' | 'flv';
+  platform_type?: 'onvif' | 'ezviz' | string;
+  access_source?: 'local' | 'cloud' | string;
+  ptz_source?: 'onvif' | 'ezviz' | string;
+  device_serial?: string;
+  channel_no?: number;
 }): Promise<Video> {
   const response = await fetch(`${API_BASE_URL}/video/add_camera`, {
     method: 'POST',
@@ -237,6 +347,67 @@ export async function ptzStopControl(videoId: number): Promise<{ status: string 
   });
   if (!response.ok) {
     let msg = 'Failed to stop PTZ';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+/** 变焦单次控制 */
+export async function zoomControl(
+  videoId: number,
+  direction: ZoomDirection,
+  speed: number = 0.5,
+  duration: number = 0.5
+): Promise<{ status: string }> {
+  const response = await fetch(`${API_BASE_URL}/video/zoom/${videoId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ direction, speed, duration }),
+  });
+  if (!response.ok) {
+    let msg = 'Failed to control zoom';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+/** 变焦开始（按下时调用） */
+export async function zoomStartControl(
+  videoId: number,
+  direction: ZoomDirection,
+  speed: number = 0.5,
+): Promise<{ status: string }> {
+  const response = await fetch(`${API_BASE_URL}/video/zoom/${videoId}/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ direction, speed, duration: 1 }),
+  });
+  if (!response.ok) {
+    let msg = 'Failed to start zoom';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+/** 变焦停止（松开时调用） */
+export async function zoomStopControl(videoId: number): Promise<{ status: string }> {
+  const response = await fetch(`${API_BASE_URL}/video/zoom/${videoId}/stop`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    let msg = 'Failed to stop zoom';
     try {
       const err = await response.json();
       msg = err.detail || msg;
@@ -374,7 +545,9 @@ export async function getCruiseStatus(videoId: number): Promise<CruiseStatus> {
   return response.json();
 }
 
-/** 保存指定设备在自定义时间段的回放视频 */
+/**
+ * @deprecated 仅历史兼容。视频中心已移除回放保存能力，请使用独立视频回放页。
+ */
 export async function savePlaybackClip(
   videoId: number,
   payload: PlaybackSavePayload
@@ -397,6 +570,92 @@ export async function savePlaybackClip(
   return response.json();
 }
 
+/**
+ * @deprecated 仅历史兼容。视频中心已移除分段回放能力，请使用独立视频回放页。
+ */
+export async function getRecordingSegments(
+  videoId: number,
+  limit: number = 72
+): Promise<RecordingSegment[]> {
+  const response = await fetch(`${API_BASE_URL}/video/${videoId}/recordings?limit=${limit}`);
+  if (!response.ok) {
+    let msg = 'Failed to get recording segments';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+export async function triggerTempPlaybackCache(videoId: number): Promise<TempCacheSaveResponse> {
+  const response = await fetch(`${API_BASE_URL}/video/${videoId}/playback/temp-cache`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force: true }),
+  });
+
+  if (!response.ok) {
+    let msg = 'Failed to save temp playback cache';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+
+  return response.json();
+}
+
+export async function getSavedPlaybackVideos(
+  videoId: number,
+  limit: number = 120
+): Promise<SavedPlaybackVideo[]> {
+  const response = await fetch(`${API_BASE_URL}/video/${videoId}/playback/videos?limit=${limit}`);
+  if (!response.ok) {
+    let msg = 'Failed to get saved playback videos';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+export async function getTempPlaybackVideos(
+  videoId: number,
+  limit: number = 30
+): Promise<SavedPlaybackVideo[]> {
+  const response = await fetch(`${API_BASE_URL}/video/${videoId}/playback/temp/videos?limit=${limit}`);
+  if (!response.ok) {
+    let msg = 'Failed to get temp playback videos';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
+export async function getAlarmPlaybackVideos(
+  videoId: number,
+  limit: number = 120
+): Promise<SavedPlaybackVideo[]> {
+  const response = await fetch(`${API_BASE_URL}/video/${videoId}/alarm/videos?limit=${limit}`);
+  if (!response.ok) {
+    let msg = 'Failed to get alarm videos';
+    try {
+      const err = await response.json();
+      msg = err.detail || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return response.json();
+}
+
 // --- 新增：AI 监控控制接口 ---
 
 // 开启指定设备的 AI 监控
@@ -404,25 +663,50 @@ export async function savePlaybackClip(
 
 // 1. 开启 AI 监控
 export const startAIMonitoring = async (deviceId: string, rtspUrl: string, algoType: string = "helmet") => {
-  // 注意：这里假设你的后端运行在 localhost:8000，且 API_BASE_URL 已正确定义
-  // 如果 videoApi.ts 顶部已经定义了 API_BASE_URL，请直接使用它
-  // 如果没有，请手动替换为 'http://localhost:8000/api'
-  const response = await fetch(`http://127.0.0.1:9000/video/ai/start`, {
+  const response = await fetch(`${API_BASE_URL}/video/ai/start`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ device_id: deviceId, rtsp_url: rtspUrl, algo_type: algoType }),
   });
-  return response.json();
+
+  if (!response.ok) {
+    let msg = 'Failed to start AI monitoring';
+    try {
+      const err = await response.json();
+      msg = err.detail || err.message || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+
+  const data = await response.json();
+  if (data?.code && Number(data.code) !== 200) {
+    throw new Error(data?.message || 'Failed to start AI monitoring');
+  }
+  return data;
 };
 
 // 2. 停止 AI 监控
 export const stopAIMonitoring = async (deviceId: string) => {
-  const response = await fetch(`http://127.0.0.1:9000/video/ai/stop?device_id=${deviceId}`, {
+  const response = await fetch(`${API_BASE_URL}/video/ai/stop?device_id=${encodeURIComponent(deviceId)}`, {
     method: 'POST',
   });
-  return response.json();
+
+  if (!response.ok) {
+    let msg = 'Failed to stop AI monitoring';
+    try {
+      const err = await response.json();
+      msg = err.detail || err.message || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+
+  const data = await response.json();
+  if (data?.code && Number(data.code) !== 200) {
+    throw new Error(data?.message || 'Failed to stop AI monitoring');
+  }
+  return data;
 };
 
 export const getAIRules = async (): Promise<AIRule[]> => {

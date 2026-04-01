@@ -13,13 +13,26 @@ class VideoBase(BaseModel):
     参考 fence_schema.py 的设计模式。
     """
     name: str = Field(..., description="摄像头名称")
-    ip_address: str = Field(..., description="设备IP地址")
+    ip_address: Optional[str] = Field(None, description="设备IP地址")
     port: int = Field(80, description="服务端口")
     username: Optional[str] = Field(None, description="登录用户名")
     password: Optional[str] = Field(None, description="登录密码")
     
     stream_url: Optional[str] = Field(None, description="流地址 (RTSP/HLS/FLV)")
     rtsp_url: Optional[str] = Field(None, description="摄像头RTSP地址")
+    stream_protocol: Optional[str] = Field(None, description="拉流协议偏好: ezopen/hls/rtmp/flv")
+
+    platform_type: Optional[str] = Field(None, description="设备平台类型: onvif/ezviz")
+    access_source: Optional[str] = Field(None, description="视频访问来源: local/cloud")
+    ptz_source: Optional[str] = Field(None, description="PTZ 控制来源: onvif/ezviz")
+    device_serial: Optional[str] = Field(None, description="萤石设备序列号")
+    channel_no: Optional[int] = Field(1, description="萤石通道号")
+
+    supports_ptz: Optional[int] = Field(1, description="是否支持云台")
+    supports_preset: Optional[int] = Field(1, description="是否支持预置点")
+    supports_cruise: Optional[int] = Field(1, description="是否支持巡航")
+    supports_zoom: Optional[int] = Field(1, description="是否支持变焦")
+    supports_focus: Optional[int] = Field(0, description="是否支持焦距")
     
     latitude: Optional[float] = Field(None, description="纬度 (GCJ-02)")
     longitude: Optional[float] = Field(None, description="经度 (GCJ-02)")
@@ -43,6 +56,17 @@ class VideoUpdate(BaseModel):
     password: Optional[str] = None
     stream_url: Optional[str] = None
     rtsp_url: Optional[str] = None
+    stream_protocol: Optional[str] = None
+    platform_type: Optional[str] = None
+    access_source: Optional[str] = None
+    ptz_source: Optional[str] = None
+    device_serial: Optional[str] = None
+    channel_no: Optional[int] = None
+    supports_ptz: Optional[int] = None
+    supports_preset: Optional[int] = None
+    supports_cruise: Optional[int] = None
+    supports_zoom: Optional[int] = None
+    supports_focus: Optional[int] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     status: Optional[VideoStatus] = None
@@ -60,6 +84,17 @@ class VideoOut(VideoBase):
     ip_address: Optional[str] = None
     port: Optional[int] = None
     rtsp_url: Optional[str] = None
+    stream_protocol: Optional[str] = None
+    platform_type: Optional[str] = None
+    access_source: Optional[str] = None
+    ptz_source: Optional[str] = None
+    device_serial: Optional[str] = None
+    channel_no: Optional[int] = 1
+    supports_ptz: Optional[int] = 1
+    supports_preset: Optional[int] = 1
+    supports_cruise: Optional[int] = 1
+    supports_zoom: Optional[int] = 1
+    supports_focus: Optional[int] = 0
     
     # --- 修改部分开始 ---
     # 原代码: status: VideoStatus
@@ -88,6 +123,21 @@ class CameraCreateRequest(BaseModel):
     latitude: Optional[float] = Field(None, description="纬度 (可选)")
     longitude: Optional[float] = Field(None, description="经度 (可选)")
     remark: Optional[str] = Field(None, description="备注信息 (可选)")
+    stream_protocol: Optional[str] = Field(None, description="拉流协议偏好: ezopen/hls/rtmp/flv")
+    platform_type: Optional[str] = Field(None, description="设备平台类型: onvif/ezviz")
+    access_source: Optional[str] = Field(None, description="视频访问来源: local/cloud")
+    ptz_source: Optional[str] = Field(None, description="PTZ 控制来源: onvif/ezviz")
+    device_serial: Optional[str] = Field(None, description="萤石设备序列号")
+    channel_no: Optional[int] = Field(1, description="萤石通道号")
+
+
+class StreamUrlResponse(BaseModel):
+    url: str
+    play_type: str
+    platform: str
+    device_serial: Optional[str] = None
+    channel_no: Optional[int] = None
+    access_token: Optional[str] = None
 
 class PTZDirection(str, Enum):
     UP = "up"

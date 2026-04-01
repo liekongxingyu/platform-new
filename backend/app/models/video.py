@@ -19,6 +19,23 @@ class VideoDevice(Base):
     # 流媒体信息
     stream_url = Column(Text, comment="原始流地址 (RTSP/HLS/FLV)")
     rtsp_url = Column(Text, nullable=True, comment="摄像头RTSP地址")
+    stream_protocol = Column(String(20), nullable=True, comment="拉流协议偏好: ezopen/hls/rtmp/flv")
+
+    # 平台与来源路由
+    platform_type = Column(String(20), nullable=True, comment="设备平台类型: onvif/ezviz")
+    access_source = Column(String(20), nullable=True, comment="视频访问来源: local/cloud")
+    ptz_source = Column(String(20), nullable=True, comment="PTZ 控制来源: onvif/ezviz")
+
+    # 云平台设备标识
+    device_serial = Column(String(100), nullable=True, comment="萤石设备序列号")
+    channel_no = Column(Integer, nullable=True, default=1, comment="萤石通道号")
+
+    # 能力标记
+    supports_ptz = Column(Integer, default=1, comment="是否支持云台")
+    supports_preset = Column(Integer, default=1, comment="是否支持预置点")
+    supports_cruise = Column(Integer, default=1, comment="是否支持巡航")
+    supports_zoom = Column(Integer, default=1, comment="是否支持变焦")
+    supports_focus = Column(Integer, default=0, comment="是否支持焦距")
     
     # 地理位置信息 (用于在地图上标记)
     latitude = Column(Float, nullable=True, comment="纬度 (GCJ-02)")
