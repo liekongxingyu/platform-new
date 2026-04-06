@@ -2143,7 +2143,7 @@ class VideoService:
 
         return segments
 
-    def save_playback_clip(self, video_id: int, start_time: datetime | str, end_time: datetime | str, output_type: str = "playback", filename_prefix: Optional[str] = None, alarm_time: Optional[datetime] = None, details: Optional[Dict] = None):
+    def save_playback_clip(self, video_id: int, start_time: datetime | str, end_time: datetime | str, output_type: str = "playback", filename_prefix: Optional[str] = None):
         start_dt = self._parse_datetime_input(start_time)
         end_dt = self._parse_datetime_input(end_time)
         if end_dt <= start_dt:
@@ -2216,86 +2216,31 @@ class VideoService:
             clip_offset = max(0.0, (start_dt - first_seg_start).total_seconds())
             clip_duration = max(1.0, (end_dt - start_dt).total_seconds())
 
-            # --- 报警视频标注增强 ---
-            vf_filter = None
-            if output_type == "alarm" and details and alarm_time:
-                try:
-                    boxes = details.get("boxes", [])
-                    if boxes:
-                        rel_alarm_time = (alarm_time - start_dt).total_seconds()
-                        start_visible = max(0, rel_alarm_time - 5)
-                        # 确保显示时长足够（前后 5 秒，一共 10 秒）
-                        end_visible = rel_alarm_time + 5
-                        
-                        # Windows FFmpeg 特殊路径转义：要把 ':' 转义成 '\:'
-                        font_path = "C\\:/Windows/Fonts/simhei.ttf"
-                        filter_chains = []
-                        for box in boxes:
-                            coords = box.get("coords")
-                            if not coords or len(coords) < 4: continue
-                            x1, y1, x2, y2 = [int(v) for v in coords[:4]]
-                            label = box.get("msg") or box.get("type", "报警")
-                            score = box.get("score")
-                            if score: label = f"{label} {score:.0%}"
-                            
-                            # 颜色映射 (ffmpeg 格式)
-                            color = "orange"
-                            if "未佩戴" in label or "head" in label.lower(): color = "red"
-                            elif "helmet" in label.lower() or "合规" in label: color = "green"
-                            
-                            # 添加绘制框和文字的滤镜链 (注意转义)
-                            safe_label = label.replace(":", "\\:").replace("'", "")
-                            filter_chains.append(
-                                f"drawbox=x={x1}:y={y1}:w={x2-x1}:h={y2-y1}:color={color}@0.8:t=4:enable='between(t,{start_visible:.1f},{end_visible:.1f})'"
-                            )
-                            # 如果字体文件不存在，drawtext 会报错导致整个 vf 失败，所以加 try/catch 或用默认字体
-                            filter_chains.append(
-                                f"drawtext=text='{safe_label}':x={x1}:y={y1-30 if y1 > 35 else y1+10}:fontsize=28:fontfile='{font_path}':fontcolor=white:box=1:boxcolor={color}@0.6:enable='between(t,{start_visible:.1f},{end_visible:.1f})'"
-                            )
-                        if filter_chains:
-                            vf_filter = ",".join(filter_chains)
-                            logger.info(f"Generated alarm vf_filter (len={len(vf_filter)}) for video_id={video_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to build annotation filters: {e}")
-
             trim_cmd = [
                 ffmpeg_path,
                 "-y",
                 "-ss", f"{clip_offset:.3f}",
                 "-i", concat_output_path,
                 "-t", f"{clip_duration:.3f}",
+                "-c", "copy",
+                final_output_path,
             ]
-            
-            if vf_filter:
-                # 有滤镜必须重编码
-                trim_cmd.extend([
-                    "-vf", vf_filter,
-                    "-c:v", "libx264",
-                    "-preset", "ultrafast",
-                    "-c:a", "copy",
-                ])
-            else:
-                trim_cmd.extend(["-c", "copy"])
-                
-            trim_cmd.append(final_output_path)
-            
             trim_proc = subprocess.run(trim_cmd, capture_output=True, text=True)
             if trim_proc.returncode != 0:
-                # 即使加了滤镜失败了，也尝试用 copy 兜底输出一个普通视频
-                logger.warning(f"Trim with annotations failed, falling back to copy: {trim_proc.stderr}")
                 trim_fallback_cmd = [
                     ffmpeg_path,
                     "-y",
                     "-ss", f"{clip_offset:.3f}",
                     "-i", concat_output_path,
                     "-t", f"{clip_duration:.3f}",
-                    "-c", "copy",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-c:a", "aac",
                     final_output_path,
                 ]
                 trim_fallback_proc = subprocess.run(trim_fallback_cmd, capture_output=True, text=True)
                 if trim_fallback_proc.returncode != 0:
                     raise ValueError("录像裁剪失败")
-
 
             if not os.path.exists(final_output_path) or os.path.getsize(final_output_path) == 0:
                 raise ValueError("生成的视频文件无效")

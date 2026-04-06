@@ -462,7 +462,7 @@ class AIManager:
 
         return canvas
 
-    def _save_alarm_clip_async(self, alarm_id: int, device_id: str, alarm_time: datetime, details: dict | None = None):
+    def _save_alarm_clip_async(self, alarm_id: int, device_id: str, alarm_time: datetime):
         def _worker():
             try:
                 video_id = int(device_id)
@@ -470,14 +470,14 @@ class AIManager:
                 self._update_alarm_recording_status(alarm_id, "failed", None, "device_id 非摄像头ID，无法自动录像")
                 return
 
-            # 等待到“报警后1分钟窗口”结束，且尾部分段成熟。
+            # 等待到“报警后2分钟窗口”结束，且尾部分段达到可拼接成熟期，避免末段仍在写入导致失败。
             mature_buffer = RECORD_SEGMENT_SECONDS + RECORD_SEGMENT_SAFE_MARGIN_SECONDS
-            wait_seconds = (alarm_time + timedelta(minutes=1, seconds=mature_buffer) - datetime.now()).total_seconds()
+            wait_seconds = (alarm_time + timedelta(minutes=2, seconds=mature_buffer) - datetime.now()).total_seconds()
             if wait_seconds > 0:
-                time.sleep(min(wait_seconds, 150))
+                time.sleep(min(wait_seconds, 300))
 
-            clip_start = alarm_time - timedelta(minutes=1)
-            clip_end = alarm_time + timedelta(minutes=1)
+            clip_start = alarm_time - timedelta(minutes=2)
+            clip_end = alarm_time + timedelta(minutes=2)
 
             last_error = None
             for attempt in range(1, 3):
@@ -488,8 +488,6 @@ class AIManager:
                         clip_end,
                         output_type="alarm",
                         filename_prefix=f"alarm_{alarm_id}",
-                        alarm_time=alarm_time,
-                        details=details,
                     )
                     self._update_alarm_recording_status(
                         alarm_id,
@@ -567,7 +565,7 @@ class AIManager:
             db.commit()
             db.refresh(record)
 
-            self._save_alarm_clip_async(record.id, str(device_id), record.timestamp or datetime.now(), details=details)
+            self._save_alarm_clip_async(record.id, str(device_id), record.timestamp or datetime.now())
 
             print(f"✅ 报警已保存 (ID: {record.id})")
             return record.id
