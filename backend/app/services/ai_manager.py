@@ -470,12 +470,12 @@ class AIManager:
                 self._update_alarm_recording_status(alarm_id, "failed", None, "device_id 非摄像头ID，无法自动录像")
                 return
 
-            # 增加等待时间：报警后 1 分钟的录像 + 20 秒缓冲，确保分段写入磁盘
-            wait_seconds = (alarm_time + timedelta(seconds=80) - datetime.now()).total_seconds()
+            # 等待到“报警后1分钟窗口”结束，且尾部分段成熟。
+            mature_buffer = RECORD_SEGMENT_SECONDS + RECORD_SEGMENT_SAFE_MARGIN_SECONDS
+            wait_seconds = (alarm_time + timedelta(minutes=1, seconds=mature_buffer) - datetime.now()).total_seconds()
             if wait_seconds > 0:
-                time.sleep(min(wait_seconds, 120))
+                time.sleep(min(wait_seconds, 150))
 
-            # 保存前后 1 分钟，总计 2 分钟
             clip_start = alarm_time - timedelta(minutes=1)
             clip_end = alarm_time + timedelta(minutes=1)
 
